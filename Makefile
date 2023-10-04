@@ -16,6 +16,18 @@ GIT_ROOT = $(shell git rev-parse --show-toplevel)
 GOBIN ?= $(shell pwd)/bin
 GOFILES = go list -f '{{range .GoFiles}}{{ $$.Dir }}/{{ . }} {{end}}{{range .TestGoFiles}}{{ $$.Dir }}/{{ . }} {{end}}' $(PKG)
 
+SCYLLA_VERSION?=5.1.13
+IP_FAMILY?=IPV4
+
+MANAGER_CONFIG := testing/scylla-manager/scylla-manager.yaml
+PUBLIC_NET := 192.168.200.
+MINIO_ENDPOINT := http://192.168.200.99:9000
+ifeq ($(IP_FAMILY), IPV6)
+	MANAGER_CONFIG := testing/scylla-manager/scylla-manager-ipv6.yaml
+	PUBLIC_NET := 2001:0DB9:200::
+	MINIO_ENDPOINT := http://[2001:0DB9:200::99]:9000
+endif
+
 .PHONY: fmt
 fmt: ## Format source code
 	@$(GOBIN)/golangci-lint run -c .golangci-fmt.yml --fix $(PKG)
@@ -102,9 +114,10 @@ integration-test:
 # Load Minio config for INTEGRATION_TEST_ARGS
 include testing/.env
 
-INTEGRATION_TEST_ARGS := -cluster 192.168.100.100 \
--managed-cluster 192.168.100.11,192.168.100.12,192.168.100.13,192.168.100.21,192.168.100.22,192.168.100.23 \
--managed-second-cluster 192.168.100.30 \
+INTEGRATION_TEST_ARGS := -cluster $(PUBLIC_NET)100 \
+-managed-cluster $(PUBLIC_NET)11,$(PUBLIC_NET)12,$(PUBLIC_NET)13,$(PUBLIC_NET)21,$(PUBLIC_NET)22,$(PUBLIC_NET)23 \
+-test-network $(PUBLIC_NET) \
+-managed-second-cluster $(PUBLIC_NET)31,$(PUBLIC_NET)32 \
 -user cassandra -password cassandra \
 -agent-auth-token token \
 -s3-data-dir ./testing/minio/data -s3-provider Minio -s3-endpoint $(MINIO_ENDPOINT) -s3-access-key-id $(MINIO_USER_ACCESS_KEY) -s3-secret-access-key $(MINIO_USER_SECRET_KEY)
@@ -121,8 +134,9 @@ pkg-integration-test:
 	@echo "==> Running integration tests for package $(PKG)"
 	@docker kill scylla_manager_server 2> /dev/null || true
 	@CGO_ENABLED=0 GOOS=linux go test -tags integration -c -o ./integration-test.dev $(PKG)
+	@PWD=`pwd`; echo $(INTEGRATION_TEST_ARGS) $(SSL_FLAGS) $(ARGS) | sed -e "s=./testing=${PWD}/testing=g"
 	@docker run --name "scylla_manager_server" \
-		--network scylla_manager_public \
+		--network host \
 		-v "/tmp:/tmp" \
 		-v "$(PWD)/integration-test.dev:/usr/bin/integration-test:ro" \
 		-v "$(PWD)/testing:/integration-test/testing" \
@@ -145,11 +159,11 @@ start-dev-env: .testing-up deploy-agent build-cli
 
 .PHONY: .testing-up
 .testing-up:
-	@make -C testing build down up
+	@IPV6=$(IPV6) SCYLLA_VERSION=$(SCYLLA_VERSION) make -C testing build down up
 
 .PHONY: dev-env-status
 dev-env-status:  ## Checks status of docker containers and cluster nodes
-	@make -C testing status
+	@IPV6=$(IPV6) make -C testing status
 
 .PHONY: build-agent
 build-agent: ## Build development agent binary
@@ -159,7 +173,7 @@ build-agent: ## Build development agent binary
 .PHONY: deploy-agent
 deploy-agent: build-agent ## Deploy it to testing containers
 	@echo "==> Deploying agent to testing containers"
-	@make -C testing deploy-agent restart-agent
+	@IPV6=$(IPV6) make -C testing deploy-agent restart-agent
 
 .PHONY: build-cli
 build-cli: ## Build development cli binary
@@ -174,14 +188,16 @@ build-server: ## Build development server
 .PHONY: run-server
 run-server: build-server ## Build and run development server
 	@docker run --name "scylla_manager_server" \
-		--network scylla_manager_public \
+		--network scylla_manager_second \
 		-p "5080:5080" \
 		-p "5443:5443" \
 		-p "5090:5090" \
 		-v "$(PWD)/scylla-manager.dev:/usr/bin/scylla-manager:ro" \
-		-v "$(PWD)/testing/scylla-manager/scylla-manager.yaml:/etc/scylla-manager/scylla-manager.yaml:ro" \
+		-v "$(PWD)/sctool.dev:/usr/bin/sctool:ro" \
+		-v "$(PWD)/$(MANAGER_CONFIG):/etc/scylla-manager/scylla-manager.yaml:ro" \
 		-v "/tmp:/tmp" \
 		-i --read-only --rm scylladb/scylla-manager-dev scylla-manager
+	@docker network connect scylla_manager_public scylla-manager
 
 .PHONY: build
 build: build-cli build-agent build-server ## Build all project binaries

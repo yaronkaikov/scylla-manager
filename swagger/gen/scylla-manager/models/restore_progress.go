@@ -32,6 +32,9 @@ type RestoreProgress struct {
 	// keyspaces
 	Keyspaces []*RestoreKeyspaceProgress `json:"keyspaces"`
 
+	// repair progress
+	RepairProgress *RepairProgress `json:"repair_progress,omitempty"`
+
 	// restored
 	Restored int64 `json:"restored,omitempty"`
 
@@ -47,6 +50,9 @@ type RestoreProgress struct {
 	// started at
 	// Format: date-time
 	StartedAt *strfmt.DateTime `json:"started_at,omitempty"`
+
+	// views
+	Views []*RestoreViewProgress `json:"views"`
 }
 
 // Validate validates this restore progress
@@ -61,7 +67,15 @@ func (m *RestoreProgress) Validate(formats strfmt.Registry) error {
 		res = append(res, err)
 	}
 
+	if err := m.validateRepairProgress(formats); err != nil {
+		res = append(res, err)
+	}
+
 	if err := m.validateStartedAt(formats); err != nil {
+		res = append(res, err)
+	}
+
+	if err := m.validateViews(formats); err != nil {
 		res = append(res, err)
 	}
 
@@ -109,6 +123,24 @@ func (m *RestoreProgress) validateKeyspaces(formats strfmt.Registry) error {
 	return nil
 }
 
+func (m *RestoreProgress) validateRepairProgress(formats strfmt.Registry) error {
+
+	if swag.IsZero(m.RepairProgress) { // not required
+		return nil
+	}
+
+	if m.RepairProgress != nil {
+		if err := m.RepairProgress.Validate(formats); err != nil {
+			if ve, ok := err.(*errors.Validation); ok {
+				return ve.ValidateName("repair_progress")
+			}
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (m *RestoreProgress) validateStartedAt(formats strfmt.Registry) error {
 
 	if swag.IsZero(m.StartedAt) { // not required
@@ -117,6 +149,31 @@ func (m *RestoreProgress) validateStartedAt(formats strfmt.Registry) error {
 
 	if err := validate.FormatOf("started_at", "body", "date-time", m.StartedAt.String(), formats); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func (m *RestoreProgress) validateViews(formats strfmt.Registry) error {
+
+	if swag.IsZero(m.Views) { // not required
+		return nil
+	}
+
+	for i := 0; i < len(m.Views); i++ {
+		if swag.IsZero(m.Views[i]) { // not required
+			continue
+		}
+
+		if m.Views[i] != nil {
+			if err := m.Views[i].Validate(formats); err != nil {
+				if ve, ok := err.(*errors.Validation); ok {
+					return ve.ValidateName("views" + "." + strconv.Itoa(i))
+				}
+				return err
+			}
+		}
+
 	}
 
 	return nil

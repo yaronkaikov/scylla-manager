@@ -7,6 +7,7 @@ package scyllaclient_test
 
 import (
 	"context"
+	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
 	"net/http"
 	"testing"
 

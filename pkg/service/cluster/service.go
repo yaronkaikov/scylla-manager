@@ -8,7 +8,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"sort"
-	"strconv"
 
 	"github.com/gocql/gocql"
 	"github.com/pkg/errors"
@@ -252,6 +251,9 @@ func (s *Service) GetClusterByName(ctx context.Context, name string) (*Cluster, 
 	}
 }
 
+// NameFunc returns name for a given ID.
+type NameFunc func(ctx context.Context, clusterID uuid.UUID) (string, error)
+
 // GetClusterName returns cluster name for a given ID. If nothing was found
 // scylla-manager.ErrNotFound is returned.
 func (s *Service) GetClusterName(ctx context.Context, id uuid.UUID) (string, error) {
@@ -465,6 +467,14 @@ func (s *Service) DeleteCluster(ctx context.Context, clusterID uuid.UUID) error 
 	return s.notifyChangeListener(ctx, Change{ID: clusterID, Type: Delete})
 }
 
+// CheckCQLCredentials checks if associated CQLCreds exist in secrets store.
+func (s *Service) CheckCQLCredentials(id uuid.UUID) (bool, error) {
+	credentials := secrets.CQLCreds{
+		ClusterID: id,
+	}
+	return s.secretsStore.Check(&credentials)
+}
+
 // DeleteCQLCredentials removes the associated CQLCreds from secrets store.
 func (s *Service) DeleteCQLCredentials(_ context.Context, clusterID uuid.UUID) error {
 	return s.secretsStore.Delete(&secrets.CQLCreds{
@@ -513,6 +523,9 @@ func (s *Service) ListNodes(ctx context.Context, clusterID uuid.UUID) ([]Node, e
 	return nodes, nil
 }
 
+// SessionFunc returns CQL session for given cluster ID.
+type SessionFunc func(ctx context.Context, clusterID uuid.UUID) (gocqlx.Session, error)
+
 // GetSession returns CQL session to provided cluster.
 func (s *Service) GetSession(ctx context.Context, clusterID uuid.UUID) (session gocqlx.Session, err error) {
 	s.logger.Debug(ctx, "GetSession", "cluster_id", clusterID)
@@ -527,16 +540,15 @@ func (s *Service) GetSession(ctx context.Context, clusterID uuid.UUID) (session 
 		return session, errors.Wrap(err, "fetch node info")
 	}
 
-	scyllaCluster := gocql.NewCluster(client.Config().Hosts...)
-
-	// Set port if needed
-	if cqlPort := ni.CQLPort(client.Config().Hosts[0]); cqlPort != "9042" {
-		p, err := strconv.Atoi(cqlPort)
-		if err != nil {
-			return session, errors.Wrap(err, "parse cql port")
+	sessionHosts, err := GetRPCAddresses(ctx, client, client.Config().Hosts)
+	if err != nil {
+		s.logger.Info(ctx, "GetSession", "err", err)
+		if errors.Is(err, ErrNoRPCAddressesFound) {
+			return session, err
 		}
-		scyllaCluster.Port = p
 	}
+
+	scyllaCluster := gocql.NewCluster(sessionHosts...)
 
 	if ni.CqlPasswordProtected {
 		credentials := secrets.CQLCreds{
@@ -603,4 +615,29 @@ func (s *Service) notifyChangeListener(ctx context.Context, c Change) error {
 // Close closes all connections to cluster.
 func (s *Service) Close() {
 	s.clientCache.Close()
+}
+
+// ErrNoRPCAddressesFound is the error representation of "no RPC addresses found".
+var ErrNoRPCAddressesFound = errors.New("no RPC addresses found")
+
+// GetRPCAddresses accepts client and hosts parameters that are used later on to query client.NodeInfo endpoint
+// returning RPC addresses for given hosts.
+// RPC addresses are the ones that scylla uses to accept CQL connections.
+func GetRPCAddresses(ctx context.Context, client *scyllaclient.Client, hosts []string) ([]string, error) {
+	var sessionHosts []string
+	var combinedError error
+	for _, h := range hosts {
+		ni, err := client.NodeInfo(ctx, h)
+		if err != nil {
+			combinedError = multierr.Append(combinedError, err)
+			continue
+		}
+		sessionHosts = append(sessionHosts, ni.CQLAddr(h))
+	}
+
+	if len(sessionHosts) == 0 {
+		combinedError = multierr.Append(ErrNoRPCAddressesFound, combinedError)
+	}
+
+	return sessionHosts, combinedError
 }

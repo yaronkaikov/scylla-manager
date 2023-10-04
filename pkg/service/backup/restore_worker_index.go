@@ -12,6 +12,7 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	. "github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
+	"github.com/scylladb/scylla-manager/v3/pkg/sstable"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/parallel"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 	"go.uber.org/atomic"
@@ -39,6 +40,7 @@ type indexWorker struct {
 	// that should be used during the restore procedure. It should be initialized per each restored table.
 	versionedFiles VersionedMap
 	fileSizesCache map[string]int64
+	progress       *TotalRestoreProgress
 }
 
 func (w *indexWorker) filesMetaRestoreHandler(ctx context.Context, run *RestoreRun, target RestoreTarget) func(fm FilesMeta) error {
@@ -194,10 +196,27 @@ func (w *indexWorker) workFunc(ctx context.Context, run *RestoreRun, target Rest
 
 			pr.setRestoreCompletedAt()
 			w.insertRunProgress(ctx, pr)
-
 			restoredBytes := pr.Downloaded + pr.Skipped + pr.VersionedProgress
-			w.metrics.DecreaseRemainingBytes(w.ClusterID, target.SnapshotTag, w.location, w.miwc.DC, w.miwc.NodeID,
-				pr.Keyspace, pr.Table, restoredBytes)
+
+			labels := metrics.RestoreBytesLabels{
+				ClusterID:   w.ClusterID.String(),
+				SnapshotTag: target.SnapshotTag,
+				Location:    w.location.String(),
+				DC:          w.miwc.DC,
+				Node:        w.miwc.NodeID,
+				Keyspace:    pr.Keyspace,
+				Table:       pr.Table,
+			}
+			w.metrics.DecreaseRemainingBytes(labels, restoredBytes)
+
+			w.progress.Update(restoredBytes)
+			progress := w.progress.CurrentProgress()
+
+			progressLabels := metrics.RestoreProgressLabels{
+				ClusterID:   w.ClusterID.String(),
+				SnapshotTag: target.SnapshotTag,
+			}
+			w.metrics.SetProgress(progressLabels, progress)
 
 			w.Logger.Info(ctx, "Restored batch", "host", h.Host, "sstable_id", pr.SSTableID)
 			// Close pool and free hosts awaiting on it if all SSTables have been successfully restored.
@@ -223,7 +242,7 @@ func (w *indexWorker) initBundlePool(ctx context.Context, run *RestoreRun, sstab
 	w.bundles = make(map[string]bundle)
 
 	for _, f := range sstables {
-		id := sstableID(f)
+		id := sstable.ExtractID(f)
 		w.bundles[id] = append(w.bundles[id], f)
 	}
 
@@ -372,11 +391,14 @@ func (w *indexWorker) decreaseBatchSizeMetric(clusterID uuid.UUID, batch []strin
 // Downloading of versioned files happens first in a synchronous way.
 // It returns jobID for asynchronous download of the newest versions of files
 // alongside with the size of the already downloaded versioned files.
-func (w *indexWorker) startDownload(ctx context.Context, host, dstDir, srcDir string, batch []string) (int64, int64, error) {
+func (w *indexWorker) startDownload(
+	ctx context.Context,
+	host, dstDir, srcDir string,
+	batch []string,
+) (jobID, versionedPr int64, err error) {
 	var (
 		regularBatch   = make([]string, 0)
 		versionedBatch = make([]VersionedSSTable, 0)
-		versionedPr    int64
 	)
 	// Decide which files require to be downloaded in their older version
 	for _, file := range batch {
@@ -429,7 +451,7 @@ func (w *indexWorker) startDownload(ctx context.Context, host, dstDir, srcDir st
 		return 0, 0, err
 	}
 	// Start asynchronous job for downloading the newest versions of remaining files
-	jobID, err := w.Client.RcloneCopyPaths(ctx, host, dstDir, srcDir, regularBatch)
+	jobID, err = w.Client.RcloneCopyPaths(ctx, host, dstDir, srcDir, regularBatch)
 	if err != nil {
 		return 0, 0, errors.Wrap(err, "download batch to upload dir")
 	}
@@ -556,55 +578,6 @@ func (w *indexWorker) updateDownloadProgress(ctx context.Context, pr *RestoreRun
 	pr.Failed = job.Failed
 
 	w.insertRunProgress(ctx, pr)
-}
-
-func (w *indexWorker) restoreSSTables(ctx context.Context, host, keyspace, table string, loadAndStream, primaryReplicaOnly bool) error {
-	const repeatInterval = 10 * time.Second
-
-	w.Logger.Info(ctx, "Load SSTables for the first time",
-		"host", host,
-		"load_and_stream", loadAndStream,
-		"primary_replica_only", primaryReplicaOnly,
-	)
-
-	running, err := w.Client.LoadSSTables(ctx, host, keyspace, table, loadAndStream, primaryReplicaOnly)
-	if err == nil {
-		w.Logger.Info(ctx, "Loading SSTables finished with success", "host", host)
-		return nil
-	}
-	if !running {
-		return err
-	}
-
-	w.Logger.Info(ctx, "Waiting for SSTables loading to finish, retry every 10 seconds",
-		"host", host,
-		"error", err,
-	)
-
-	ticker := time.NewTicker(repeatInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-
-		running, err := w.Client.LoadSSTables(ctx, host, keyspace, table, loadAndStream, primaryReplicaOnly)
-		if err == nil {
-			w.Logger.Info(ctx, "Loading SSTables finished with success", "host", host)
-			return nil
-		}
-		if running {
-			w.Logger.Info(ctx, "Waiting for SSTables loading to finish",
-				"host", host,
-				"error", err,
-			)
-			continue
-		}
-		return err
-	}
 }
 
 // batchFromIDs creates batch of SSTables with IDs present in ids.

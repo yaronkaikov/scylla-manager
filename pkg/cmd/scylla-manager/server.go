@@ -85,7 +85,20 @@ func (s *server) makeServices() error {
 		return errors.Wrapf(err, "healthcheck service")
 	}
 
+	s.repairSvc, err = repair.NewService(
+		s.session,
+		s.config.Repair,
+		metrics.NewRepairMetrics().MustRegister(),
+		s.clusterSvc.Client,
+		s.clusterSvc.GetSession,
+		s.logger.Named("repair"),
+	)
+	if err != nil {
+		return errors.Wrapf(err, "repair service")
+	}
+
 	s.backupSvc, err = backup.NewService(
+		s.repairSvc,
 		s.session,
 		s.config.Backup,
 		metrics.NewBackupMetrics().MustRegister(),
@@ -96,17 +109,6 @@ func (s *server) makeServices() error {
 	)
 	if err != nil {
 		return errors.Wrapf(err, "backup service")
-	}
-
-	s.repairSvc, err = repair.NewService(
-		s.session,
-		s.config.Repair,
-		metrics.NewRepairMetrics().MustRegister(),
-		s.clusterSvc.Client,
-		s.logger.Named("repair"),
-	)
-	if err != nil {
-		return errors.Wrapf(err, "repair service")
 	}
 
 	s.schedSvc, err = scheduler.NewService(

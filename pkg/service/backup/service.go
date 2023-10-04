@@ -22,6 +22,8 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/service"
 	. "github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/repair"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/scheduler"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/inexlist/dcfilter"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/inexlist/ksfilter"
@@ -34,26 +36,22 @@ import (
 
 const defaultRateLimit = 100 // 100MiB
 
-// ClusterNameFunc returns name for a given ID.
-type ClusterNameFunc func(ctx context.Context, clusterID uuid.UUID) (string, error)
-
-// SessionFunc returns CQL session for given cluster ID.
-type SessionFunc func(ctx context.Context, clusterID uuid.UUID) (gocqlx.Session, error)
-
 // Service orchestrates clusterName backups.
 type Service struct {
+	repairSvc *repair.Service
+
 	session gocqlx.Session
 	config  Config
 	metrics metrics.BackupMetrics
 
-	clusterName    ClusterNameFunc
+	clusterName    cluster.NameFunc
 	scyllaClient   scyllaclient.ProviderFunc
-	clusterSession SessionFunc
+	clusterSession cluster.SessionFunc
 	logger         log.Logger
 }
 
-func NewService(session gocqlx.Session, config Config, metrics metrics.BackupMetrics, clusterName ClusterNameFunc, scyllaClient scyllaclient.ProviderFunc,
-	clusterSession SessionFunc, logger log.Logger,
+func NewService(repairSvc *repair.Service, session gocqlx.Session, config Config, metrics metrics.BackupMetrics,
+	clusterName cluster.NameFunc, scyllaClient scyllaclient.ProviderFunc, clusterSession cluster.SessionFunc, logger log.Logger,
 ) (*Service, error) {
 	if session.Session == nil || session.Closed() {
 		return nil, errors.New("invalid session")
@@ -72,6 +70,7 @@ func NewService(session gocqlx.Session, config Config, metrics metrics.BackupMet
 	}
 
 	return &Service{
+		repairSvc:      repairSvc,
 		session:        session,
 		config:         config,
 		metrics:        metrics,
@@ -307,14 +306,14 @@ func (s *Service) getLiveNodes(ctx context.Context, client *scyllaclient.Client,
 		return nil, err
 	}
 
-	// Validate that there are enough live nodes to backup all tokens
+	// Validate that there are enough live nodes to back up all tokens
 	if len(liveNodes) < len(nodes) {
 		hosts := strset.New(liveNodes.Hosts()...)
 		for i := range target.Units {
 			r := rings[target.Units[i].Keyspace]
 			if r.Replication != scyllaclient.LocalStrategy {
-				for _, tr := range r.Tokens {
-					if !hosts.HasAny(tr.Replicas...) {
+				for _, rt := range r.ReplicaTokens {
+					if !hosts.HasAny(rt.ReplicaSet...) {
 						return nil, errors.Errorf("not enough live nodes to backup keyspace %s", target.Units[i].Keyspace)
 					}
 				}
@@ -807,17 +806,21 @@ func (s *Service) Backup(ctx context.Context, clusterID, taskID, runID uuid.UUID
 		return nil
 	}
 	stageFunc := map[Stage]func() error{
-		StageAwaitSchema: func() error {
+		StageAwaitSchema: func() error { // nolint: unparam
 			clusterSession, err := s.clusterSession(ctx, clusterID)
 			if err != nil {
-				w.Logger.Info(ctx, "No CQL cluster session, backup of schema as CQL files would be skipped", "error", err)
+				w.Logger.Info(ctx, "No CQL cluster session, backup of schema as CQL files will be skipped", "error", err)
 				return nil
 			}
 			defer clusterSession.Close()
 
 			w.AwaitSchemaAgreement(ctx, clusterSession)
 
-			return w.DumpSchema(ctx, clusterSession)
+			if err = w.DumpSchema(ctx, clusterSession); err != nil {
+				w.Logger.Info(ctx, "Couldn't dump schema, backup of schema as CQL files will be skipped", "error", err)
+				w.Schema = nil
+			}
+			return nil
 		},
 		StageSnapshot: func() error {
 			return w.Snapshot(ctx, hi, target.SnapshotParallel)
@@ -860,7 +863,7 @@ func (s *Service) Backup(ctx context.Context, clusterID, taskID, runID uuid.UUID
 		// Skip completed stages
 		if run.PrevID != uuid.Nil {
 			// Allow reindexing if previous state is manifest creation or upload
-			if stage == StageIndex && (prevStage == StageManifest || prevStage == StageUpload) {
+			if stage == StageIndex && (prevStage == StageManifest || prevStage == StageUpload) { //nolint: revive
 				// continue
 			} else if prevStage.Index() > stage.Index() {
 				return nil

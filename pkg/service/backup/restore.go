@@ -5,11 +5,12 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/scylladb/gocqlx/v2/qb"
 	. "github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
+	"github.com/scylladb/scylla-manager/v3/pkg/util/query"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
 
@@ -41,13 +42,13 @@ func (s *Service) GetRestoreTarget(ctx context.Context, clusterID uuid.UUID, pro
 	}
 	t.sortLocations()
 
+	if t.Keyspace == nil {
+		t.Keyspace = []string{"*"}
+	}
 	if t.RestoreSchema {
 		t.Keyspace = []string{"system_schema"}
 	}
 	if t.RestoreTables {
-		if t.Keyspace == nil {
-			t.Keyspace = []string{"*"}
-		}
 		// Skip restoration of those tables regardless of the '--keyspace' param
 		doNotRestore := []string{
 			"system",        // system.* tables are recreated on every cluster and shouldn't even be backed-up
@@ -68,11 +69,16 @@ func (s *Service) GetRestoreTarget(ctx context.Context, clusterID uuid.UUID, pro
 
 		// Filter out all materialized views and secondary indexes. They are not a part of restore procedure at the moment.
 		// See https://docs.scylladb.com/stable/operating-scylla/procedures/backup-restore/restore.html#repeat-the-following-steps-for-each-node-in-the-cluster.
-		views, err := s.listAllViews(ctx, clusterID)
+		clusterSession, err := s.clusterSession(ctx, clusterID)
 		if err != nil {
-			return t, errors.Wrapf(err, "list all views of cluster %s", clusterID.String())
+			return t, errors.Wrap(err, "get cluster session")
 		}
-		for _, viewName := range views {
+		views, err := query.GetAllViews(clusterSession)
+		if err != nil {
+			return t, errors.Wrap(err, "get cluster views")
+		}
+
+		for _, viewName := range views.List() {
 			t.Keyspace = append(t.Keyspace, "!"+viewName)
 		}
 	}
@@ -81,13 +87,13 @@ func (s *Service) GetRestoreTarget(ctx context.Context, clusterID uuid.UUID, pro
 	if err != nil {
 		return t, errors.Wrapf(err, "get client")
 	}
+	if err = client.VerifyNodesAvailability(ctx); err != nil {
+		return t, errors.Wrap(err, "verify all nodes availability")
+	}
 
 	status, err := client.Status(ctx)
 	if err != nil {
 		return t, errors.Wrap(err, "get status")
-	}
-	if len(status) == 0 {
-		return t, errors.New("empty status")
 	}
 	// Check if for each location there is at least one host
 	// living in location's dc with access to it.
@@ -104,7 +110,7 @@ func (s *Service) GetRestoreTarget(ctx context.Context, clusterID uuid.UUID, pro
 			}
 		}
 
-		if _, err = client.GetLiveNodesWithLocationAccess(ctx, locationStatus, remotePath); err != nil {
+		if _, err = client.GetNodesWithLocationAccess(ctx, locationStatus, remotePath); err != nil {
 			if strings.Contains(err.Error(), "NoSuchBucket") {
 				return t, errors.Errorf("specified bucket does not exist: %s", l)
 			}
@@ -160,60 +166,77 @@ func (s *Service) Restore(ctx context.Context, clusterID, taskID, runID uuid.UUI
 			Config:      s.config,
 			Logger:      s.logger.Named("restore"),
 		},
+		repairSvc:               s.repairSvc,
 		metrics:                 s.metrics.Restore,
 		managerSession:          s.session,
 		clusterSession:          clusterSession,
 		forEachRestoredManifest: s.forEachRestoredManifest(clusterID, target),
 	}
 
-	var w restoreWorker
+	if err := tools.decorateWithPrevRun(ctx, run, target.Continue); err != nil {
+		return err
+	}
+	if run.PrevID != uuid.Nil {
+		tools.clonePrevProgress(ctx, run)
+	} else {
+		s.metrics.Restore.ResetClusterMetrics(clusterID)
+	}
+	tools.insertRun(ctx, run)
+
+	if run.Units == nil {
+		// Cache must be initialised only once, as they contain the original tombstone_gc mode
+		// and statements for recreating dropped views.
+		run.Units, err = tools.newUnits(ctx, target)
+		if err != nil {
+			return errors.Wrap(err, "initialize units")
+		}
+		run.Views, err = tools.newViews(ctx, run.Units)
+		if err != nil {
+			return errors.Wrap(err, "initialize views")
+		}
+	} else {
+		// Check that all units are still present after resume
+		for _, u := range run.Units {
+			for _, t := range u.Tables {
+				if err = tools.ValidateTableExists(u.Keyspace, t.Table); err != nil {
+					return errors.Wrapf(err, "validate table %s.%s still exists", u.Keyspace, t.Table)
+				}
+			}
+		}
+	}
+	tools.insertRun(ctx, run)
+
+	var w restorer
+	ru, err := s.GetRestoreUnits(ctx, clusterID, target)
+	if err != nil {
+		return fmt.Errorf("could not get restore units for current restore run: %w", err)
+	}
+
+	var totalBytesToRestore int64
+	for _, unit := range ru {
+		totalBytesToRestore += unit.Size
+	}
+
 	if target.RestoreTables {
-		w = &tablesWorker{restoreWorkerTools: tools}
+		w = &tablesWorker{
+			restoreWorkerTools: tools,
+			progress:           NewTotalRestoreProgress(totalBytesToRestore),
+		}
 	} else {
 		w = &schemaWorker{restoreWorkerTools: tools}
 	}
 
-	if target.Continue {
-		if err := w.decorateWithPrevRun(ctx, run); err != nil {
-			return err
-		}
-
-		w.insertRun(ctx, run)
-		// Update run with previous progress.
-		if run.PrevID != uuid.Nil {
-			w.clonePrevProgress(ctx, run)
-		}
-	} else {
-		w.insertRun(ctx, run)
-	}
-	// Check if restore is the continuation of previous run.
-	if target.Continue && run.PrevID != uuid.Nil {
-		w.continuePrevRun()
-	} else {
-		s.metrics.Restore.ResetClusterMetrics(clusterID)
-	}
-	// As manifests are immutable, units can be initialized only once per task
-	if run.Units == nil {
-		run.Units, err = w.newUnits(ctx, target)
-		if err != nil {
-			return errors.Wrap(err, "initialize units")
-		}
-	}
-
-	run.Stage = StageRestoreData
-	w.insertRun(ctx, run)
-
-	if err = w.restore(ctx, run, target); err != nil {
-		return errors.Wrapf(err, "restore data")
+	if err := w.restore(ctx, run, target); err != nil {
+		return err
 	}
 
 	run.Stage = StageRestoreDone
-	w.insertRun(ctx, run)
+	tools.insertRun(ctx, run)
 
 	return nil
 }
 
-// GetRestoreUnits restored units specified in restore target.
+// GetRestoreUnits restored units specified by restore target.
 func (s *Service) GetRestoreUnits(ctx context.Context, clusterID uuid.UUID, target RestoreTarget) ([]RestoreUnit, error) {
 	clusterSession, err := s.clusterSession(ctx, clusterID)
 	if err != nil {
@@ -229,15 +252,45 @@ func (s *Service) GetRestoreUnits(ctx context.Context, clusterID uuid.UUID, targ
 	return w.newUnits(ctx, target)
 }
 
+// GetRestoreViews restored views specified by restore units.
+func (s *Service) GetRestoreViews(ctx context.Context, clusterID uuid.UUID, units []RestoreUnit) ([]RestoreView, error) {
+	client, err := s.scyllaClient(ctx, clusterID)
+	if err != nil {
+		return nil, errors.Wrap(err, "get client")
+	}
+	clusterSession, err := s.clusterSession(ctx, clusterID)
+	if err != nil {
+		return nil, errors.Wrap(err, "get cluster session")
+	}
+	defer clusterSession.Close()
+
+	w := &restoreWorkerTools{
+		workerTools: workerTools{
+			Client: client,
+		},
+		clusterSession: clusterSession,
+	}
+
+	return w.newViews(ctx, units)
+}
+
 // GetRestoreProgress aggregates progress for the run of the task and breaks it down
 // by keyspace and table.json.
 func (s *Service) GetRestoreProgress(ctx context.Context, clusterID, taskID, runID uuid.UUID) (RestoreProgress, error) {
+	client, err := s.scyllaClient(ctx, clusterID)
+	if err != nil {
+		return RestoreProgress{}, errors.Wrap(err, "get client")
+	}
+
 	w := &restoreWorkerTools{
 		workerTools: workerTools{
 			ClusterID: clusterID,
 			TaskID:    taskID,
 			RunID:     runID,
+			Client:    client,
+			Logger:    s.logger.Named("restore"),
 		},
+		repairSvc:      s.repairSvc,
 		managerSession: s.session,
 	}
 
@@ -254,28 +307,4 @@ func (s *Service) forEachRestoredManifest(clusterID uuid.UUID, target RestoreTar
 		}
 		return s.forEachManifest(ctx, clusterID, []Location{location}, filter, f)
 	}
-}
-
-// listAllViews is the utility function that queries system_schema.views table to get list of all views created on the cluster.
-// system_schema.views contains view definitions for materialized views and for secondary indexes.
-func (s *Service) listAllViews(ctx context.Context, clusterID uuid.UUID) (views []string, err error) {
-	// Get cluster session
-	clusterSession, err := s.clusterSession(ctx, clusterID)
-	if err != nil {
-		return nil, errors.Wrap(err, "get CQL cluster session")
-	}
-
-	iter := qb.Select("system_schema.views").
-		Columns("keyspace_name", "view_name").
-		Query(clusterSession).Iter()
-	defer func() {
-		err = iter.Close()
-	}()
-
-	var keyspace, view string
-	for iter.Scan(&keyspace, &view) {
-		views = append(views, keyspace+"."+view)
-	}
-
-	return
 }

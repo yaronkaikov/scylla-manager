@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-import os
-import sys
 from datetime import date
 
 from sphinx_scylladb_theme.utils import multiversion_regex_builder
@@ -9,9 +7,9 @@ from sphinx_scylladb_theme.utils import multiversion_regex_builder
 
 # Build documentation for the following tags and branches
 TAGS = []
-BRANCHES = ['master', 'branch-2.2', 'branch-2.3', 'branch-2.4', 'branch-2.5', 'branch-2.6', 'branch-3.0', 'branch-3.1']
+BRANCHES = ['master', 'branch-2.2', 'branch-2.3', 'branch-2.4', 'branch-2.5', 'branch-2.6', 'branch-3.0', 'branch-3.1', 'branch-3.2']
 # Set the latest version.
-LATEST_VERSION = 'branch-3.1'
+LATEST_VERSION = 'branch-3.2'
 # Set which versions are not released yet.
 UNSTABLE_VERSIONS = ['master']
 # Set which versions are deprecated
@@ -81,7 +79,7 @@ smv_outputdir_format = '{ref.name}'
 
 # -- Options for sitemap extension ---------------------------------------
 
-sitemap_url_scheme = 'stable/{link}'
+sitemap_url_scheme = "/stable/{link}"
 
 # -- Options for HTML output ---------------------------------------------
 
@@ -102,6 +100,7 @@ html_theme_options = {
     'github_issues_repository': 'scylladb/scylla-manager',
     'github_repository': 'scylladb/scylla-manager',
     'hide_edit_this_page_button': 'false',
+    'hide_feedback_buttons': 'false',
     'tag_substring_removed': 'scylla-manager-',
     'versions_unstable': UNSTABLE_VERSIONS,
     'versions_deprecated': DEPRECATED_VERSIONS,

@@ -1,5 +1,5 @@
 RELEASE      := 0.$(shell date +%Y%m%d).$(shell git describe --always)
-VERSION	     ?= 3.2-dev
+VERSION	     ?= 3.3.0-dev
 
 ifdef $$VERSION
 VERSION := $$VERSION
@@ -13,7 +13,7 @@ GORELEASER := goreleaser --clean
 .PHONY: release
 release:
 	git tag $(VERSION_NAME) || true
-	$(GORELEASER) --skip-publish --skip-validate
+	$(GORELEASER) --skip=publish --skip=validate
 
 .PHONY: snapshot
 snapshot:

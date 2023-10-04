@@ -2,7 +2,7 @@
   "swagger": "2.0",
   "info": {
     "title": "Scylla Manager API",
-    "version": ""
+    "version": "1.2.0"
   },
   "basePath": "/api/v1",
   "produces": [
@@ -144,6 +144,14 @@
     "RepairProgress": {
       "type": "object",
       "properties": {
+        "success_percentage": {
+          "type": "number",
+          "format": "int"
+        },
+        "error_percentage": {
+          "type": "number",
+          "format": "int"
+        },
         "token_ranges": {
           "type": "number",
           "format": "int"
@@ -178,10 +186,16 @@
         "host": {
           "type": "string"
         },
+        "max_intensity": {
+          "type": "number"
+        },
         "intensity": {
           "type": "number"
         },
         "parallel": {
+          "type": "integer"
+        },
+        "max_parallel": {
           "type": "integer"
         },
         "hosts": {
@@ -645,6 +659,12 @@
         "size": {
           "type": "integer"
         },
+        "views": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RestoreView"
+          }
+        },
         "batch_size": {
           "type": "integer"
         },
@@ -670,10 +690,33 @@
         }
       }
     },
+    "RestoreView": {
+      "type": "object",
+      "properties": {
+        "keyspace": {
+          "type": "string"
+        },
+        "view": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "base_table": {
+          "type": "string"
+        },
+        "create_stmt": {
+          "type": "string"
+        }
+      }
+    },
     "RestoreTable": {
       "type": "object",
       "properties": {
         "table": {
+          "type": "string"
+        },
+        "tombstone_gc": {
           "type": "string"
         },
         "size": {
@@ -774,6 +817,12 @@
             "$ref": "#/definitions/RestoreKeyspaceProgress"
           }
         },
+        "views": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/RestoreViewProgress"
+          }
+        },
         "stage": {
           "type": "string"
         },
@@ -798,6 +847,9 @@
           "type": "string",
           "format": "date-time",
           "x-nullable": true
+        },
+        "repair_progress": {
+          "$ref": "#/definitions/RepairProgress"
         }
       }
     },
@@ -906,6 +958,29 @@
         }
       }
     },
+    "RestoreViewProgress": {
+      "type": "object",
+      "properties": {
+        "keyspace": {
+          "type": "string"
+        },
+        "view": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "base_table": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "create_stmt": {
+          "type": "string"
+        }
+      }
+    },
     "RestoreKeyspaceProgress": {
       "type": "object",
       "properties": {
@@ -946,6 +1021,9 @@
       "type": "object",
       "properties": {
         "table": {
+          "type": "string"
+        },
+        "tombstone_gc": {
           "type": "string"
         },
         "error": {
@@ -1043,6 +1121,10 @@
     "ErrorResponse": {
       "type": "object",
       "properties": {
+        "details": {
+          "description": "Human readable description",
+          "type": "string"
+        },
         "message": {
           "description": "Error description",
           "type": "string"

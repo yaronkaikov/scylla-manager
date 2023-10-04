@@ -3,10 +3,13 @@
 package scyllaclient
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"math"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"runtime"
 	"sort"
@@ -20,24 +23,13 @@ import (
 	"go.uber.org/multierr"
 )
 
-// GetLiveNodesWithLocationAccess returns subset of nodes which are UN, passed connectivity check
-// and have access to remote location.
-func (c *Client) GetLiveNodesWithLocationAccess(ctx context.Context, nodes NodeStatusInfoSlice, remotePath string) (NodeStatusInfoSlice, error) {
-	liveNodes, err := c.GetLiveNodes(ctx, nodes)
-	if err != nil {
-		return nil, err
-	}
+// GetNodesWithLocationAccess returns subset of nodes which have access to remote location.
+func (c *Client) GetNodesWithLocationAccess(ctx context.Context, nodes NodeStatusInfoSlice, remotePath string) (NodeStatusInfoSlice, error) {
+	nodeErr := make([]error, len(nodes))
+	err := parallel.Run(len(nodes), parallel.NoLimit, func(i int) error {
+		n := nodes[i]
 
-	liveNodes = liveNodes.Live()
-	if len(liveNodes) == 0 {
-		return nil, errors.New("no live (UN) nodes")
-	}
-
-	nodeErr := make([]error, len(liveNodes))
-	err = parallel.Run(len(liveNodes), parallel.NoLimit, func(i int) error {
-		n := liveNodes[i]
-
-		err = c.RcloneCheckPermissions(ctx, n.Addr, remotePath)
+		err := c.RcloneCheckPermissions(ctx, n.Addr, remotePath)
 		if err == nil {
 			c.logger.Info(ctx, "Host location access check OK",
 				"host", n.Addr,
@@ -58,19 +50,19 @@ func (c *Client) GetLiveNodesWithLocationAccess(ctx context.Context, nodes NodeS
 		return nil, errors.Wrap(err, "check location access")
 	}
 
-	checkedNodes := make(NodeStatusInfoSlice, 0)
+	checked := make(NodeStatusInfoSlice, 0)
 	for i, err := range nodeErr {
 		if err == nil {
-			checkedNodes = append(checkedNodes, liveNodes[i])
+			checked = append(checked, nodes[i])
 		}
 	}
 
-	if len(checkedNodes) == 0 {
+	if len(checked) == 0 {
 		combinedErr := multierr.Combine(nodeErr...)
-		return nil, errors.Wrapf(combinedErr, "no live nodes with access to loaction: %s", remotePath)
+		return nil, errors.Wrapf(combinedErr, "no nodes with access to loaction: %s", remotePath)
 	}
 
-	return checkedNodes, nil
+	return checked, nil
 }
 
 // GetLiveNodes returns subset of nodes that passed connectivity check.
@@ -275,4 +267,34 @@ func min(a, b time.Duration) time.Duration {
 		return b
 	}
 	return a
+}
+
+// PingAgent is a simple heartbeat ping to agent.
+func (c *Client) PingAgent(ctx context.Context, host string, timeout time.Duration) (time.Duration, error) {
+	if timeout == 0 {
+		timeout = c.config.Timeout
+	}
+	if ctxTimeout, hasCustomTimeout := hasCustomTimeout(ctx); hasCustomTimeout {
+		timeout = min(ctxTimeout, timeout)
+	}
+	ctx = customTimeout(ctx, timeout)
+	ctx = noRetry(ctx)
+
+	u := c.newURL(host, "/ping")
+	req, err := http.NewRequestWithContext(forceHost(ctx, host), http.MethodGet, u.String(), bytes.NewReader(nil))
+	if err != nil {
+		return 0, err
+	}
+
+	t := timeutc.Now()
+	resp, err := c.client.Do("PingAgent", req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		return 0, fmt.Errorf("expected %d status code from ping response, got %d", http.StatusNoContent, resp.StatusCode)
+	}
+	return timeutc.Since(t), nil
 }

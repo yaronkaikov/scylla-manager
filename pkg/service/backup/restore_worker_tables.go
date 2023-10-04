@@ -4,10 +4,16 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"sync"
 
 	"github.com/pkg/errors"
 	"github.com/scylladb/go-set/strset"
-	"github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
+	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
+	. "github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/repair"
+	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
 
 type tablesWorker struct {
@@ -15,27 +21,129 @@ type tablesWorker struct {
 
 	hosts        []restoreHost // Restore units created for currently restored location
 	continuation bool          // Defines if the worker is part of resume task that is the continuation of previous run
+	progress     *TotalRestoreProgress
+}
+
+// TotalRestoreProgress is a struct that holds information about the total progress of the restore job.
+type TotalRestoreProgress struct {
+	restoredBytes       int64
+	totalBytesToRestore int64
+	mu                  sync.RWMutex
+}
+
+func NewTotalRestoreProgress(totalBytesToRestore int64) *TotalRestoreProgress {
+	return &TotalRestoreProgress{
+		restoredBytes:       0,
+		totalBytesToRestore: totalBytesToRestore,
+	}
+}
+
+// CurrentProgress returns current progress of the restore job in percentage.
+func (p *TotalRestoreProgress) CurrentProgress() float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	if p.totalBytesToRestore == 0 {
+		return 100
+	}
+
+	if p.restoredBytes == 0 {
+		return 0
+	}
+
+	progress := float64(p.restoredBytes) / float64(p.totalBytesToRestore) * 100
+	return progress
+}
+
+// Update updates the progress of the restore job, caller should provide number of bytes restored by its job.
+func (p *TotalRestoreProgress) Update(bytesRestored int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.restoredBytes += bytesRestored
 }
 
 // restoreData restores files from every location specified in restore target.
 func (w *tablesWorker) restore(ctx context.Context, run *RestoreRun, target RestoreTarget) error {
-	w.AwaitSchemaAgreement(ctx, w.clusterSession)
+	if target.Continue && run.PrevID != uuid.Nil && run.Table != "" {
+		w.continuation = true
+	}
 	if !w.continuation {
-		w.initRemainingBytesMetric(ctx, run, target)
+		w.initRestoreMetrics(ctx, run, target)
 	}
 
-	w.Logger.Info(ctx, "Started restoring tables")
-	defer w.Logger.Info(ctx, "Restoring tables finished")
-	// Disable gc_grace_seconds
-	for _, u := range run.Units {
-		for _, t := range u.Tables {
-			if err := w.DisableTableGGS(ctx, u.Keyspace, t.Table); err != nil {
-				return errors.Wrap(err, "disable table's ggs")
+	stageFunc := map[RestoreStage]func() error{
+		StageRestoreDropViews: func() error {
+			for _, v := range run.Views {
+				if err := w.DropView(ctx, v); err != nil {
+					return errors.Wrapf(err, "drop %s.%s", v.Keyspace, v.View)
+				}
+			}
+			return nil
+		},
+		StageRestoreDisableTGC: func() error {
+			w.AwaitSchemaAgreement(ctx, w.clusterSession)
+			for _, u := range run.Units {
+				for _, t := range u.Tables {
+					if err := w.AlterTableTombstoneGC(ctx, u.Keyspace, t.Table, modeDisabled); err != nil {
+						return errors.Wrapf(err, "disable %s.%s tombstone_gc", u.Keyspace, t.Table)
+					}
+				}
+			}
+			return nil
+		},
+		StageRestoreData: func() error {
+			return w.stageRestoreData(ctx, run, target)
+		},
+		StageRestoreRepair: func() error {
+			return w.stageRepair(ctx, run, target)
+		},
+		StageRestoreEnableTGC: func() error {
+			w.AwaitSchemaAgreement(ctx, w.clusterSession)
+			for _, u := range run.Units {
+				for _, t := range u.Tables {
+					if err := w.AlterTableTombstoneGC(ctx, u.Keyspace, t.Table, t.TombstoneGC); err != nil {
+						return errors.Wrapf(err, "enable %s.%s tombstone_gc", u.Keyspace, t.Table)
+					}
+				}
+			}
+			return nil
+		},
+		StageRestoreRecreateViews: func() error {
+			for _, v := range run.Views {
+				if err := w.CreateView(ctx, v); err != nil {
+					return errors.Wrapf(err, "recreate %s.%s with statement %s", v.Keyspace, v.View, v.CreateStmt)
+				}
+				if err := w.WaitForViewBuilding(ctx, v); err != nil {
+					return errors.Wrapf(err, "wait for %s.%s", v.Keyspace, v.View)
+				}
+			}
+			return nil
+		},
+	}
+
+	for i, s := range RestoreStageOrder() {
+		if i < run.Stage.Index() {
+			continue
+		}
+		run.Stage = s
+		w.insertRun(ctx, run)
+		w.Logger.Info(ctx, "Executing stage", "name", s)
+
+		if f, ok := stageFunc[s]; ok {
+			if err := f(); err != nil {
+				return err
 			}
 		}
 	}
-	// Disabling table's ggs alters schema, so we need to wait for the agreement again
+
+	return nil
+}
+
+func (w *tablesWorker) stageRestoreData(ctx context.Context, run *RestoreRun, target RestoreTarget) error {
 	w.AwaitSchemaAgreement(ctx, w.clusterSession)
+	w.Logger.Info(ctx, "Started restoring tables")
+	defer w.Logger.Info(ctx, "Restoring tables finished")
 
 	// Restore locations in deterministic order
 	for _, l := range target.Location {
@@ -47,11 +155,10 @@ func (w *tablesWorker) restore(ctx context.Context, run *RestoreRun, target Rest
 			return err
 		}
 	}
-
 	return nil
 }
 
-func (w *tablesWorker) locationRestoreHandler(ctx context.Context, run *RestoreRun, target RestoreTarget, location backupspec.Location) error {
+func (w *tablesWorker) locationRestoreHandler(ctx context.Context, run *RestoreRun, target RestoreTarget, location Location) error {
 	w.Logger.Info(ctx, "Restoring location", "location", location)
 	defer w.Logger.Info(ctx, "Restoring location finished", "location", location)
 
@@ -62,7 +169,7 @@ func (w *tablesWorker) locationRestoreHandler(ctx context.Context, run *RestoreR
 		return errors.Wrap(err, "initialize hosts")
 	}
 
-	manifestHandler := func(miwc backupspec.ManifestInfoWithContent) error {
+	manifestHandler := func(miwc ManifestInfoWithContent) error {
 		// Check if manifest has already been processed in previous run
 		if w.continuation && run.ManifestPath != miwc.Path() {
 			w.Logger.Info(ctx, "Skipping manifest", "manifest", miwc.ManifestInfo)
@@ -79,9 +186,14 @@ func (w *tablesWorker) locationRestoreHandler(ctx context.Context, run *RestoreR
 			continuation:       w.continuation,
 			hosts:              w.hosts,
 			miwc:               miwc,
+			progress:           w.progress,
 		}
 
-		return miwc.ForEachIndexIterWithError(target.Keyspace, iw.filesMetaRestoreHandler(ctx, run, target))
+		err := miwc.ForEachIndexIterWithError(target.Keyspace, iw.filesMetaRestoreHandler(ctx, run, target))
+		// We have to keep track of continuation from filesMetaHandler,
+		// so that can stop skipping not restored manifests and locations.
+		w.continuation = iw.continuation
+		return err
 	}
 
 	return w.forEachRestoredManifest(ctx, w.location, manifestHandler)
@@ -107,7 +219,7 @@ func (w *tablesWorker) initHosts(ctx context.Context, run *RestoreRun) error {
 		}
 	}
 
-	checkedNodes, err := w.Client.GetLiveNodesWithLocationAccess(ctx, locationStatus, remotePath)
+	nodes, err := w.Client.GetNodesWithLocationAccess(ctx, locationStatus, remotePath)
 	if err != nil {
 		return errors.Wrap(err, "no live nodes in location's dc")
 	}
@@ -141,7 +253,7 @@ func (w *tablesWorker) initHosts(ctx context.Context, run *RestoreRun) error {
 	}
 
 	// Place free hosts in the pool
-	for _, n := range checkedNodes {
+	for _, n := range nodes {
 		if !hostsInPool.Has(n.Addr) {
 			w.hosts = append(w.hosts, restoreHost{
 				Host: n.Addr,
@@ -155,20 +267,47 @@ func (w *tablesWorker) initHosts(ctx context.Context, run *RestoreRun) error {
 	return nil
 }
 
-func (w *tablesWorker) continuePrevRun() {
-	w.continuation = true
+func (w *tablesWorker) stageRepair(ctx context.Context, run *RestoreRun, _ RestoreTarget) error {
+	var keyspace []string
+	for _, u := range run.Units {
+		for _, t := range u.Tables {
+			keyspace = append(keyspace, fmt.Sprintf("%s.%s", u.Keyspace, t.Table))
+		}
+	}
+	repairProps, err := json.Marshal(map[string]any{
+		"keyspace": keyspace,
+	})
+	if err != nil {
+		return errors.Wrap(err, "parse repair properties")
+	}
+
+	repairTarget, err := w.repairSvc.GetTarget(ctx, run.ClusterID, repairProps)
+	if err != nil {
+		if errors.Is(err, repair.ErrEmptyRepair) {
+			return nil
+		}
+		return errors.Wrap(err, "get repair target")
+	}
+
+	if run.RepairTaskID == uuid.Nil {
+		run.RepairTaskID = uuid.NewTime()
+	}
+	w.insertRun(ctx, run)
+	repairRunID := uuid.NewTime()
+
+	return w.repairSvc.Repair(ctx, run.ClusterID, run.RepairTaskID, repairRunID, repairTarget)
 }
 
-func (w *tablesWorker) initRemainingBytesMetric(ctx context.Context, run *RestoreRun, target RestoreTarget) {
+func (w *tablesWorker) initRestoreMetrics(ctx context.Context, run *RestoreRun, target RestoreTarget) {
 	for _, location := range target.Location {
 		err := w.forEachRestoredManifest(
 			ctx,
 			location,
-			func(miwc backupspec.ManifestInfoWithContent) error {
+			func(miwc ManifestInfoWithContent) error {
 				sizePerTableAndKeyspace := make(map[string]map[string]int64)
 				err := miwc.ForEachIndexIterWithError(
 					target.Keyspace,
-					func(fm backupspec.FilesMeta) error {
+					func(fm FilesMeta) error {
 						if sizePerTableAndKeyspace[fm.Keyspace] == nil {
 							sizePerTableAndKeyspace[fm.Keyspace] = make(map[string]int64)
 						}
@@ -177,12 +316,25 @@ func (w *tablesWorker) initRemainingBytesMetric(ctx context.Context, run *Restor
 					})
 				for kspace, sizePerTable := range sizePerTableAndKeyspace {
 					for table, size := range sizePerTable {
-						w.metrics.SetRemainingBytes(run.ClusterID, target.SnapshotTag, location, miwc.DC, miwc.NodeID,
-							kspace, table, size)
+						labels := metrics.RestoreBytesLabels{
+							ClusterID:   run.ClusterID.String(),
+							SnapshotTag: target.SnapshotTag,
+							Location:    location.String(),
+							DC:          miwc.DC,
+							Node:        miwc.NodeID,
+							Keyspace:    kspace,
+							Table:       table,
+						}
+						w.metrics.SetRemainingBytes(labels, size)
 					}
 				}
 				return err
 			})
+		progressLabels := metrics.RestoreProgressLabels{
+			ClusterID:   run.ClusterID.String(),
+			SnapshotTag: target.SnapshotTag,
+		}
+		w.metrics.SetProgress(progressLabels, 0)
 		if err != nil {
 			w.Logger.Info(ctx, "Couldn't count restore data size", "location", w.location)
 			continue

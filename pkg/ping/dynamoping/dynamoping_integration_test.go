@@ -7,15 +7,16 @@ package dynamoping
 
 import (
 	"context"
+	"github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
 	"testing"
 	"time"
 
-	"github.com/scylladb/scylla-manager/v3/pkg/testutils"
+	_ "github.com/scylladb/scylla-manager/v3/pkg/testutils"
 )
 
 func TestPingIntegration(t *testing.T) {
 	config := Config{
-		Addr:    "http://" + testutils.ManagedClusterHost() + ":8000",
+		Addr:    "http://" + testconfig.ManagedClusterHost() + ":8000",
 		Timeout: 250 * time.Millisecond,
 	}
 

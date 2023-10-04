@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
+
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/scylladb/go-log"
@@ -47,29 +49,16 @@ func TestClientStatusIntegration(t *testing.T) {
 	}
 
 	golden := scyllaclient.NodeStatusInfoSlice{
-		{Datacenter: "dc1", Addr: "192.168.100.11", State: "", Status: true},
-		{Datacenter: "dc1", Addr: "192.168.100.12", State: "", Status: true},
-		{Datacenter: "dc1", Addr: "192.168.100.13", State: "", Status: true},
-		{Datacenter: "dc2", Addr: "192.168.100.21", State: "", Status: true},
-		{Datacenter: "dc2", Addr: "192.168.100.22", State: "", Status: true},
-		{Datacenter: "dc2", Addr: "192.168.100.23", State: "", Status: true},
+		{Datacenter: "dc1", Addr: ExpandIP(ToCanonicalIP(IPFromTestNet("11"))), State: "", Status: true},
+		{Datacenter: "dc1", Addr: ExpandIP(ToCanonicalIP(IPFromTestNet("12"))), State: "", Status: true},
+		{Datacenter: "dc1", Addr: ExpandIP(ToCanonicalIP(IPFromTestNet("13"))), State: "", Status: true},
+		{Datacenter: "dc2", Addr: ExpandIP(ToCanonicalIP(IPFromTestNet("21"))), State: "", Status: true},
+		{Datacenter: "dc2", Addr: ExpandIP(ToCanonicalIP(IPFromTestNet("22"))), State: "", Status: true},
+		{Datacenter: "dc2", Addr: ExpandIP(ToCanonicalIP(IPFromTestNet("23"))), State: "", Status: true},
 	}
 
-	if diff := cmp.Diff(status, golden, cmpopts.IgnoreFields(scyllaclient.NodeStatusInfo{}, "HostID")); diff != "" {
+	if diff := cmp.Diff(golden, status, cmpopts.IgnoreFields(scyllaclient.NodeStatusInfo{}, "HostID")); diff != "" {
 		t.Fatalf("Status() = %#+v, diff %s", status, diff)
-	}
-}
-
-func TestClientRepairStatusIntegration(t *testing.T) {
-	client, err := scyllaclient.NewClient(scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken()), log.NewDevelopment())
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, longPolling := range []int{0, 1} {
-		_, err = client.RepairStatus(context.Background(), ManagedClusterHost(), "system_auth", 999, longPolling)
-		if strings.Contains(err.Error(), "attempts") {
-			t.Fatalf("RepairStatus() error %s, expected 1 attempt", err)
-		}
 	}
 }
 
@@ -219,35 +208,12 @@ func TestClientTableExistsIntegration(t *testing.T) {
 	for i := range table {
 		test := table[i]
 
-		exists, err := client.TableExists(ctx, test.Keyspace, test.Table)
+		exists, err := client.TableExists(ctx, "", test.Keyspace, test.Table)
 		if err != nil {
 			t.Fatalf("TableExists failed: %s", err)
 		}
 		if exists != test.Exists {
 			t.Fatalf("TableExists() = %v, expected %v", exists, test.Exists)
-		}
-	}
-}
-
-func TestScyllaFeaturesIntegration(t *testing.T) {
-	config := scyllaclient.TestConfig(ManagedClusterHosts(), AgentAuthToken())
-	client, err := scyllaclient.NewClient(config, log.NewDevelopment())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.Background()
-	sf, err := client.ScyllaFeatures(ctx, ManagedClusterHosts()...)
-	if err != nil {
-		t.Error(err)
-	}
-
-	for _, h := range ManagedClusterHosts() {
-		if !sf[h].RowLevelRepair {
-			t.Errorf("%s host doesn't support row-level repair, but it should", h)
-		}
-		if !sf[h].RepairLongPolling {
-			t.Errorf("%s host doesn't support long polling repair, but it should", h)
 		}
 	}
 }

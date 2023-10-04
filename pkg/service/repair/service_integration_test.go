@@ -9,37 +9,17 @@ import (
 	"context"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
-	"github.com/pkg/errors"
 	"github.com/scylladb/go-log"
-	"go.uber.org/zap/zapcore"
-
 	"github.com/scylladb/scylla-manager/v3/pkg/metrics"
 	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
-	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
-	"github.com/scylladb/scylla-manager/v3/pkg/service"
 	"github.com/scylladb/scylla-manager/v3/pkg/service/repair"
-	. "github.com/scylladb/scylla-manager/v3/pkg/testutils"
+	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/db"
+	"github.com/scylladb/scylla-manager/v3/pkg/util/timeutc"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
 
 func TestServiceGetLastResumableRunIntegration(t *testing.T) {
 	session := CreateScyllaManagerDBSession(t)
-
-	s, err := repair.NewService(
-		session,
-		repair.DefaultConfig(),
-		metrics.NewRepairMetrics(),
-		func(context.Context, uuid.UUID) (*scyllaclient.Client, error) {
-			return nil, errors.New("not implemented")
-		},
-		log.NewDevelopmentWithLevel(zapcore.InfoLevel).Named("repair"),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.Background()
 
 	putRun := func(t *testing.T, r *repair.Run) {
 		if err := table.RepairRun.InsertQuery(session).BindStruct(&r).ExecRelease(); err != nil {
@@ -81,9 +61,18 @@ func TestServiceGetLastResumableRunIntegration(t *testing.T) {
 		}
 		putRun(t, r1)
 
-		_, err := s.GetLastResumableRun(ctx, clusterID, taskID)
-		if !errors.Is(err, service.ErrNotFound) {
+		r2 := &repair.Run{
+			ClusterID: clusterID,
+			TaskID:    taskID,
+			ID:        uuid.NewTime(),
+		}
+
+		pm := repair.NewDBProgressManager(r2, session, metrics.NewRepairMetrics(), log.NewDevelopment())
+		if err := pm.SetPrevRunID(context.Background(), 0); err != nil {
 			t.Fatal(err)
+		}
+		if r2.PrevID != uuid.Nil {
+			t.Fatal("expected nil prev run ID")
 		}
 	})
 
@@ -105,13 +94,23 @@ func TestServiceGetLastResumableRunIntegration(t *testing.T) {
 			ClusterID: clusterID,
 			TaskID:    taskID,
 			ID:        uuid.NewTime(),
+			EndTime:   timeutc.Now(),
 		}
 		putRun(t, r1)
-		putRunProgress(t, r0, 10, 10, 0)
+		putRunProgress(t, r1, 10, 10, 0)
 
-		_, err := s.GetLastResumableRun(ctx, clusterID, taskID)
-		if !errors.Is(err, service.ErrNotFound) {
+		r2 := &repair.Run{
+			ClusterID: clusterID,
+			TaskID:    taskID,
+			ID:        uuid.NewTime(),
+		}
+
+		pm := repair.NewDBProgressManager(r2, session, metrics.NewRepairMetrics(), log.NewDevelopment())
+		if err := pm.SetPrevRunID(context.Background(), 0); err != nil {
 			t.Fatal(err)
+		}
+		if r2.PrevID != uuid.Nil {
+			t.Fatal("expected nil prev run ID")
 		}
 	})
 
@@ -136,13 +135,18 @@ func TestServiceGetLastResumableRunIntegration(t *testing.T) {
 		}
 		putRun(t, r1)
 
-		r, err := s.GetLastResumableRun(ctx, clusterID, taskID)
-		if err != nil {
-			t.Fatal(err)
+		r2 := &repair.Run{
+			ClusterID: clusterID,
+			TaskID:    taskID,
+			ID:        uuid.NewTime(),
 		}
 
-		if diff := cmp.Diff(r, r0, UUIDComparer(), cmp.AllowUnexported(repair.Run{})); diff != "" {
-			t.Fatal(diff)
+		pm := repair.NewDBProgressManager(r2, session, metrics.NewRepairMetrics(), log.NewDevelopment())
+		if err := pm.SetPrevRunID(context.Background(), 0); err != nil {
+			t.Fatal(err)
+		}
+		if r2.PrevID != r0.ID {
+			t.Fatal("expected r0 run ID")
 		}
 	})
 }

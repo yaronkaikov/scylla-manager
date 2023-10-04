@@ -4,10 +4,10 @@ package backup
 
 import (
 	"context"
-	"strings"
 
 	"github.com/scylladb/gocqlx/v2/qb"
 	"github.com/scylladb/scylla-manager/v3/pkg/schema/table"
+	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 )
 
 // aggregateProgress returns restore progress information classified by keyspace and tables.
@@ -27,7 +27,8 @@ func (w *restoreWorkerTools) aggregateProgress(ctx context.Context, run *Restore
 		for _, t := range u.Tables {
 			key.table = t.Table
 			tableMap[key] = &RestoreTableProgress{
-				Table: t.Table,
+				Table:       t.Table,
+				TombstoneGC: t.TombstoneGC,
 				restoreProgress: restoreProgress{
 					Size:        t.Size,
 					StartedAt:   &maxTime,
@@ -66,6 +67,22 @@ func (w *restoreWorkerTools) aggregateProgress(ctx context.Context, run *Restore
 
 	p.extremeToNil()
 
+	for _, v := range run.Views {
+		status, err := w.Client.ViewBuildStatus(ctx, v.Keyspace, v.View)
+		if err != nil {
+			w.Logger.Error(ctx, "Couldn't get view build status",
+				"keyspace", v.Keyspace,
+				"view", v.View,
+				"error", err,
+			)
+			status = scyllaclient.StatusUnknown
+		}
+		p.Views = append(p.Views, RestoreViewProgress{
+			RestoreView: v,
+			Status:      status,
+		})
+	}
+
 	return p
 }
 
@@ -94,7 +111,7 @@ func aggregateRestoreTableProgress(tableMap map[tableKey]*RestoreTableProgress) 
 		if tab.Error == "" {
 			tab.Error = pr.Error
 		} else if pr.Error != "" {
-			tab.Error = strings.Join([]string{tab.Error, pr.Error}, "\n")
+			tab.Error = tab.Error + "\n" + pr.Error
 		}
 
 		tableMap[key] = tab
@@ -126,7 +143,8 @@ func (rp *restoreProgress) calcParentProgress(child restoreProgress) {
 // ForEachProgress iterates over all RestoreRunProgress that belong to the run.
 // NOTE: callback is always called with the same pointer - only the value that it points to changes.
 func (w *restoreWorkerTools) ForEachProgress(ctx context.Context, run *RestoreRun, cb func(*RestoreRunProgress)) {
-	iter := table.RestoreRunProgress.SelectQuery(w.managerSession).BindMap(qb.M{
+	q := table.RestoreRunProgress.SelectQuery(w.managerSession)
+	iter := q.BindMap(qb.M{
 		"cluster_id": run.ClusterID,
 		"task_id":    run.TaskID,
 		"run_id":     run.ID,
@@ -140,6 +158,7 @@ func (w *restoreWorkerTools) ForEachProgress(ctx context.Context, run *RestoreRu
 				"error", err,
 			)
 		}
+		q.Release()
 	}()
 
 	pr := new(RestoreRunProgress)
@@ -152,14 +171,15 @@ func (w *restoreWorkerTools) ForEachProgress(ctx context.Context, run *RestoreRu
 // with the same manifest, keyspace and table as the run.
 // NOTE: callback is always called with the same pointer - only the value that it points to changes.
 func (w *restoreWorkerTools) ForEachTableProgress(ctx context.Context, run *RestoreRun, cb func(*RestoreRunProgress)) {
-	iter := qb.Select(table.RestoreRunProgress.Name()).Where(
+	q := qb.Select(table.RestoreRunProgress.Name()).Where(
 		qb.Eq("cluster_id"),
 		qb.Eq("task_id"),
 		qb.Eq("run_id"),
 		qb.Eq("manifest_path"),
 		qb.Eq("keyspace_name"),
 		qb.Eq("table_name"),
-	).Query(w.managerSession).BindMap(qb.M{
+	).Query(w.managerSession)
+	iter := q.BindMap(qb.M{
 		"cluster_id":    run.ClusterID,
 		"task_id":       run.TaskID,
 		"run_id":        run.ID,
@@ -179,6 +199,7 @@ func (w *restoreWorkerTools) ForEachTableProgress(ctx context.Context, run *Rest
 				"error", err,
 			)
 		}
+		q.Release()
 	}()
 
 	pr := new(RestoreRunProgress)

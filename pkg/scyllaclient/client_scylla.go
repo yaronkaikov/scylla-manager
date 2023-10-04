@@ -3,18 +3,24 @@
 package scyllaclient
 
 import (
+	"bytes"
 	"context"
+	stdErrors "errors"
+	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/pkg/errors"
 	"github.com/scylladb/go-set/strset"
+	"github.com/scylladb/scylla-manager/v3/pkg/dht"
+	"github.com/scylladb/scylla-manager/v3/pkg/util/slice"
 	"go.uber.org/multierr"
 
 	"github.com/scylladb/scylla-manager/v3/pkg/util/parallel"
@@ -23,6 +29,9 @@ import (
 	"github.com/scylladb/scylla-manager/v3/swagger/gen/scylla/v1/client/operations"
 	"github.com/scylladb/scylla-manager/v3/swagger/gen/scylla/v1/models"
 )
+
+// ErrHostInvalidResponse is to indicate that one of the root-causes is the invalid response from scylla-server.
+var ErrHostInvalidResponse = fmt.Errorf("invalid response from host")
 
 // ClusterName returns cluster name.
 func (c *Client) ClusterName(ctx context.Context) (string, error) {
@@ -87,6 +96,38 @@ func (c *Client) Status(ctx context.Context) (NodeStatusInfoSlice, error) {
 	})
 
 	return all, nil
+}
+
+// VerifyNodesAvailability checks if all nodes passed connectivity check and are in the UN state.
+func (c *Client) VerifyNodesAvailability(ctx context.Context) error {
+	status, err := c.Status(ctx)
+	if err != nil {
+		return errors.Wrap(err, "get status")
+	}
+
+	available, err := c.GetLiveNodes(ctx, status)
+	if err != nil {
+		return errors.Wrap(err, "get live nodes")
+	}
+
+	availableUN := available.Live()
+	if len(status) == len(availableUN) {
+		return nil
+	}
+
+	checked := strset.New()
+	for _, n := range availableUN {
+		checked.Add(n.HostID)
+	}
+
+	var unavailable []string
+	for _, n := range status {
+		if !checked.Has(n.HostID) {
+			unavailable = append(unavailable, n.Addr)
+		}
+	}
+
+	return fmt.Errorf("unavailable nodes: %v", unavailable)
 }
 
 func setNodeStatus(all []NodeStatusInfo, status NodeStatus, addrs []string) {
@@ -255,16 +296,6 @@ func (c *Client) Tokens(ctx context.Context, host string) ([]int64, error) {
 	return tokens, nil
 }
 
-// Partitioner returns cluster partitioner name.
-func (c *Client) Partitioner(ctx context.Context) (string, error) {
-	resp, err := c.scyllaOps.StorageServicePartitionerNameGet(&operations.StorageServicePartitionerNameGetParams{Context: ctx})
-	if err != nil {
-		return "", err
-	}
-
-	return resp.Payload, nil
-}
-
 // ShardCount returns number of shards in a node.
 // If host is empty it will pick one from the pool.
 func (c *Client) ShardCount(ctx context.Context, host string) (uint, error) {
@@ -288,6 +319,29 @@ func (c *Client) ShardCount(ctx context.Context, host string) (uint, error) {
 	}
 
 	return uint(shards), nil
+}
+
+// HostsShardCount runs ShardCount for many hosts.
+func (c *Client) HostsShardCount(ctx context.Context, hosts []string) (map[string]uint, error) {
+	shards := make([]uint, len(hosts))
+
+	f := func(i int) error {
+		sh, err := c.ShardCount(ctx, hosts[i])
+		if err != nil {
+			return parallel.Abort(errors.Wrapf(err, "%s: get shard count", hosts[i]))
+		}
+		shards[i] = sh
+		return nil
+	}
+	if err := parallel.Run(len(hosts), parallel.NoLimit, f, parallel.NopNotify); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]uint)
+	for i, h := range hosts {
+		out[h] = shards[i]
+	}
+	return out, nil
 }
 
 // metrics returns Scylla Prometheus metrics, `name` pattern be used to filter
@@ -331,30 +385,42 @@ func (c *Client) DescribeRing(ctx context.Context, keyspace string) (Ring, error
 	}
 
 	ring := Ring{
-		Tokens: make([]TokenRange, len(resp.Payload)),
-		HostDC: map[string]string{},
+		ReplicaTokens: make([]ReplicaTokenRanges, 0),
+		HostDC:        map[string]string{},
 	}
 	dcTokens := make(map[string]int)
 
-	for i, p := range resp.Payload {
-		// parse tokens
-		ring.Tokens[i].StartToken, err = strconv.ParseInt(p.StartToken, 10, 64)
+	replicaTokens := make(map[uint64][]TokenRange)
+	replicaHash := make(map[uint64][]string)
+
+	for _, p := range resp.Payload {
+		// Parse tokens
+		startToken, err := strconv.ParseInt(p.StartToken, 10, 64)
 		if err != nil {
 			return Ring{}, errors.Wrap(err, "parse StartToken")
 		}
-		ring.Tokens[i].EndToken, err = strconv.ParseInt(p.EndToken, 10, 64)
+		endToken, err := strconv.ParseInt(p.EndToken, 10, 64)
 		if err != nil {
 			return Ring{}, errors.Wrap(err, "parse EndToken")
 		}
-		// save replicas
-		ring.Tokens[i].Replicas = p.Endpoints
+
+		// Ensure deterministic order or nodes in replica set
+		sort.Strings(p.Endpoints)
+
+		// Aggregate replica set token ranges
+		hash := ReplicaHash(p.Endpoints)
+		replicaHash[hash] = p.Endpoints
+		replicaTokens[hash] = append(replicaTokens[hash], TokenRange{
+			StartToken: startToken,
+			EndToken:   endToken,
+		})
 
 		// Update host to DC mapping
 		for _, e := range p.EndpointDetails {
 			ring.HostDC[e.Host] = e.Datacenter
 		}
 
-		// Update DC token mertics
+		// Update DC token metrics
 		dcs := strset.New()
 		for _, e := range p.EndpointDetails {
 			if !dcs.Has(e.Datacenter) {
@@ -364,13 +430,25 @@ func (c *Client) DescribeRing(ctx context.Context, keyspace string) (Ring, error
 		}
 	}
 
+	for hash, tokens := range replicaTokens {
+		// Ensure deterministic order of tokens
+		sort.Slice(tokens, func(i, j int) bool {
+			return tokens[i].StartToken < tokens[j].StartToken
+		})
+
+		ring.ReplicaTokens = append(ring.ReplicaTokens, ReplicaTokenRanges{
+			ReplicaSet: replicaHash[hash],
+			Ranges:     tokens,
+		})
+	}
+
 	// Detect replication strategy
 	if len(ring.HostDC) == 1 {
 		ring.Replication = LocalStrategy
 	} else {
 		ring.Replication = NetworkTopologyStrategy
 		for _, tokens := range dcTokens {
-			if tokens != len(ring.Tokens) {
+			if tokens != len(resp.Payload) {
 				ring.Replication = SimpleStrategy
 				break
 			}
@@ -380,42 +458,48 @@ func (c *Client) DescribeRing(ctx context.Context, keyspace string) (Ring, error
 	return ring, nil
 }
 
-// RepairConfig specifies what to repair.
-type RepairConfig struct {
-	Keyspace string
-	Tables   []string
-	DC       []string
-	Hosts    []string
-	Ranges   string
+// ReplicaHash hashes replicas so that it can be used as a map key.
+func ReplicaHash(replicaSet []string) uint64 {
+	hash := xxhash.New()
+	for _, r := range replicaSet {
+		_, _ = hash.WriteString(r)   // nolint: errcheck
+		_, _ = hash.WriteString(",") // nolint: errcheck
+	}
+	return hash.Sum64()
 }
 
 // Repair invokes async repair and returns the repair command ID.
-func (c *Client) Repair(ctx context.Context, host string, config RepairConfig) (int32, error) {
+func (c *Client) Repair(ctx context.Context, keyspace, table, master string, replicaSet []string, ranges []TokenRange) (int32, error) {
+	hosts := strings.Join(replicaSet, ",")
+	dr := dumpRanges(ranges)
 	p := operations.StorageServiceRepairAsyncByKeyspacePostParams{
-		Context:  forceHost(ctx, host),
-		Keyspace: config.Keyspace,
-		Ranges:   &config.Ranges,
-	}
-
-	if config.Tables != nil {
-		tables := strings.Join(config.Tables, ",")
-		p.ColumnFamilies = &tables
-	}
-	if len(config.DC) > 0 {
-		dcs := strings.Join(config.DC, ",")
-		p.DataCenters = &dcs
-	}
-	if len(config.Hosts) > 1 {
-		h := strings.Join(config.Hosts, ",")
-		p.Hosts = &h
+		Context:        forceHost(ctx, master),
+		Keyspace:       keyspace,
+		ColumnFamilies: &table,
+		Hosts:          &hosts,
+		Ranges:         &dr,
 	}
 
 	resp, err := c.scyllaOps.StorageServiceRepairAsyncByKeyspacePost(&p)
 	if err != nil {
 		return 0, err
 	}
-
 	return resp.Payload, nil
+}
+
+func dumpRanges(ranges []TokenRange) string {
+	var buf bytes.Buffer
+	for i, ttr := range ranges {
+		if i > 0 {
+			_ = buf.WriteByte(',')
+		}
+		if ttr.StartToken > ttr.EndToken {
+			_, _ = fmt.Fprintf(&buf, "%d:%d,%d:%d", dht.Murmur3MinToken, ttr.EndToken, ttr.StartToken, dht.Murmur3MaxToken)
+		} else {
+			_, _ = fmt.Fprintf(&buf, "%d:%d", ttr.StartToken, ttr.EndToken)
+		}
+	}
+	return buf.String()
 }
 
 func repairStatusShouldRetryHandler(err error) *bool {
@@ -426,36 +510,24 @@ func repairStatusShouldRetryHandler(err error) *bool {
 	return nil
 }
 
-// RepairStatus returns current status of a repair command.
-// If waitSeconds is bigger than 0 long polling will be used.
-// waitSeconds argument represents number of seconds.
-func (c *Client) RepairStatus(ctx context.Context, host, keyspace string, id int32, waitSeconds int) (CommandStatus, error) {
-	ctx = customTimeout(forceHost(ctx, host), c.longPollingTimeout(waitSeconds))
+// RepairStatus waits for repair job to finish and returns its status.
+func (c *Client) RepairStatus(ctx context.Context, host string, id int32) (CommandStatus, error) {
+	ctx = forceHost(ctx, host)
 	ctx = withShouldRetryHandler(ctx, repairStatusShouldRetryHandler)
-
 	var (
 		resp interface {
 			GetPayload() models.RepairAsyncStatusResponse
 		}
 		err error
 	)
-	if waitSeconds > 0 {
-		resp, err = c.scyllaOps.StorageServiceRepairStatus(&operations.StorageServiceRepairStatusParams{
-			Context: ctx,
-			ID:      id,
-			Timeout: pointer.Int64Ptr(int64(waitSeconds)),
-		})
-	} else {
-		resp, err = c.scyllaOps.StorageServiceRepairAsyncByKeyspaceGet(&operations.StorageServiceRepairAsyncByKeyspaceGetParams{
-			Context:  ctx,
-			Keyspace: keyspace,
-			ID:       id,
-		})
-	}
+
+	resp, err = c.scyllaOps.StorageServiceRepairStatus(&operations.StorageServiceRepairStatusParams{
+		Context: ctx,
+		ID:      id,
+	})
 	if err != nil {
 		return "", err
 	}
-
 	return CommandStatus(resp.GetPayload()), nil
 }
 
@@ -693,64 +765,16 @@ func (c *Client) TableDiskSize(ctx context.Context, host, keyspace, table string
 	return resp.Payload, nil
 }
 
-// TableNotExistsRegex matches error messages returned by Scylla when there is no such table.
-var TableNotExistsRegex = regexp.MustCompile("^No column family|^Column family .* not found$|^Keyspace .* Does not exist|^Can't find a column family")
-
 // TableExists returns true iff table exists.
-func (c *Client) TableExists(ctx context.Context, keyspace, table string) (bool, error) {
-	_, err := c.scyllaOps.ColumnFamilyMetricsTotalDiskSpaceUsedByNameGet(&operations.ColumnFamilyMetricsTotalDiskSpaceUsedByNameGetParams{
-		Context: ctx,
-		Name:    keyspace + ":" + table,
-	})
-
-	s, m := StatusCodeAndMessageOf(err)
-	if s >= http.StatusBadRequest && TableNotExistsRegex.MatchString(m) {
-		return false, nil
+func (c *Client) TableExists(ctx context.Context, host, keyspace, table string) (bool, error) {
+	if host != "" {
+		ctx = forceHost(ctx, host)
 	}
-
-	return true, nil
-}
-
-// ScyllaFeatures returns features supported by the current Scylla release.
-func (c *Client) ScyllaFeatures(ctx context.Context, hosts ...string) (map[string]ScyllaFeatures, error) {
-	resp, err := c.scyllaOps.FailureDetectorEndpointsGet(&operations.FailureDetectorEndpointsGetParams{
-		Context: ctx,
-	})
+	resp, err := c.scyllaOps.ColumnFamilyNameGet(&operations.ColumnFamilyNameGetParams{Context: ctx})
 	if err != nil {
-		return nil, err
+		return false, err
 	}
-
-	var (
-		mu  sync.Mutex
-		out = make(map[string]ScyllaFeatures, len(hosts))
-		sfs = makeScyllaFeatures(resp.Payload)
-	)
-
-	err = parallel.Run(len(hosts), parallel.NoLimit, func(i int) error {
-		sf := sfs[hosts[i]]
-		sf.RepairLongPolling = c.checkRepairLongPolling(ctx, hosts[i])
-		mu.Lock()
-		out[hosts[i]] = sf
-		mu.Unlock()
-
-		return nil
-	}, parallel.NopNotify)
-
-	return out, err
-}
-
-var endpointNotFoundRegex = regexp.MustCompile("(?i)^not found")
-
-func (c *Client) checkRepairLongPolling(ctx context.Context, h string) bool {
-	_, err := c.scyllaOps.StorageServiceRepairStatus(&operations.StorageServiceRepairStatusParams{
-		ID:      -1, // To pass validation.
-		Context: forceHost(ctx, h),
-	})
-	s, m := StatusCodeAndMessageOf(err)
-
-	// Search for explicit "not found" string at the start of the response to
-	// exclude situations where 404 is fired for unrelated cause.
-	return !(s == http.StatusNotFound && endpointNotFoundRegex.MatchString(m))
+	return slice.ContainsString(resp.Payload, keyspace+":"+table), nil
 }
 
 // TotalMemory returns Scylla total memory from particular host.
@@ -780,6 +804,29 @@ func (c *Client) TotalMemory(ctx context.Context, host string) (int64, error) {
 	}
 
 	return totalMemory, nil
+}
+
+// HostsTotalMemory runs TotalMemory for many hosts.
+func (c *Client) HostsTotalMemory(ctx context.Context, hosts []string) (map[string]int64, error) {
+	memory := make([]int64, len(hosts))
+
+	f := func(i int) error {
+		mem, err := c.TotalMemory(ctx, hosts[i])
+		if err != nil {
+			return parallel.Abort(errors.Wrapf(err, "%s: get total memory", hosts[i]))
+		}
+		memory[i] = mem
+		return nil
+	}
+	if err := parallel.Run(len(hosts), parallel.NoLimit, f, parallel.NopNotify); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]int64)
+	for i, h := range hosts {
+		out[h] = memory[i]
+	}
+	return out, nil
 }
 
 // HostKeyspaceTable is a tuple of Host and Keyspace and Table names.
@@ -819,7 +866,7 @@ func (c *Client) TableDiskSizeReport(ctx context.Context, hostKeyspaceTables Hos
 
 		size, err := c.TableDiskSize(ctx, v.Host, v.Keyspace, v.Table)
 		if err != nil {
-			return parallel.Abort(errors.Wrapf(err, v.Host))
+			return parallel.Abort(errors.Wrapf(stdErrors.Join(err, ErrHostInvalidResponse), v.Host))
 		}
 		c.logger.Debug(ctx, "Table disk size",
 			"host", v.Host,
@@ -900,11 +947,47 @@ func (c *Client) DisableAutoCompaction(ctx context.Context, keyspace, table stri
 }
 
 // FlushTable flushes writes stored in MemTable into SSTables stored on disk.
-func (c *Client) FlushTable(ctx context.Context, keyspace, table string) error {
+func (c *Client) FlushTable(ctx context.Context, host, keyspace, table string) error {
 	_, err := c.scyllaOps.StorageServiceKeyspaceFlushByKeyspacePost(&operations.StorageServiceKeyspaceFlushByKeyspacePostParams{
 		Cf:       &table,
 		Keyspace: keyspace,
-		Context:  ctx,
+		Context:  forceHost(ctx, host),
 	})
 	return err
+}
+
+// ViewBuildStatus returns the earliest (among all nodes) build status for given view.
+func (c *Client) ViewBuildStatus(ctx context.Context, keyspace, view string) (ViewBuildStatus, error) {
+	resp, err := c.scyllaOps.StorageServiceViewBuildStatusesByKeyspaceAndViewGet(&operations.StorageServiceViewBuildStatusesByKeyspaceAndViewGetParams{
+		Context:  ctx,
+		Keyspace: keyspace,
+		View:     view,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if len(resp.Payload) == 0 {
+		return StatusUnknown, nil
+	}
+
+	minStatus := StatusSuccess
+	for _, v := range resp.Payload {
+		status := ViewBuildStatus(v.Value)
+		if status.Index() < minStatus.Index() {
+			minStatus = status
+		}
+	}
+	return minStatus, nil
+}
+
+// ToCanonicalIP replaces ":0:0" in IPv6 addresses with "::"
+// ToCanonicalIP("192.168.0.1") -> "192.168.0.1"
+// ToCanonicalIP("100:200:0:0:0:0:0:1") -> "100:200::1".
+func ToCanonicalIP(host string) string {
+	val := net.ParseIP(host)
+	if val == nil {
+		return host
+	}
+	return val.String()
 }

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"testing"
 
+	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
+
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/pkg/errors"
@@ -24,6 +26,7 @@ import (
 	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/store"
 	. "github.com/scylladb/scylla-manager/v3/pkg/testutils"
+	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/db"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
 
@@ -277,6 +280,44 @@ func TestServiceStorageIntegration(t *testing.T) {
 		assertSecrets(t, c)
 	})
 
+	t.Run("check existing CQL credentials", func(t *testing.T) {
+		setup(t)
+
+		c := tlsCluster()
+		c.ID = uuid.Nil
+
+		if err := s.PutCluster(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		ok, err := s.CheckCQLCredentials(c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal("expected true")
+		}
+	})
+
+	t.Run("check non-existing CQL credentials", func(t *testing.T) {
+		setup(t)
+
+		c := tlsCluster()
+		c.ID = uuid.Nil
+		c.Username = ""
+		c.Password = ""
+
+		if err := s.PutCluster(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		ok, err := s.CheckCQLCredentials(c.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			t.Fatal("expected false")
+		}
+	})
+
 	t.Run("delete cluster removes secrets", func(t *testing.T) {
 		setup(t)
 
@@ -437,35 +478,40 @@ func TestServiceStorageIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		for id := range got {
+			got[id].Address = ToCanonicalIP(got[id].Address)
+		}
+
 		expected := []cluster.Node{
 			{
 				"dc1",
-				"192.168.100.11",
+				ToCanonicalIP(IPFromTestNet("11")),
 				2,
 			},
 			{
 				"dc1",
-				"192.168.100.12",
+				ToCanonicalIP(IPFromTestNet("12")),
 				2,
 			},
 			{
 				"dc1",
-				"192.168.100.13",
+				ToCanonicalIP(IPFromTestNet("13")),
 				2,
 			},
 			{
 				"dc2",
-				"192.168.100.21",
+				ToCanonicalIP(IPFromTestNet("21")),
 				2,
 			},
 			{
 				"dc2",
-				"192.168.100.22",
+				ToCanonicalIP(IPFromTestNet("22")),
 				2,
 			},
 			{
 				"dc2",
-				"192.168.100.23",
+				ToCanonicalIP(IPFromTestNet("23")),
 				2,
 			},
 		}

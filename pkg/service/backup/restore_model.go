@@ -10,6 +10,8 @@ import (
 	"github.com/gocql/gocql"
 	"github.com/pkg/errors"
 	"github.com/scylladb/gocqlx/v2"
+	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/repair"
 
 	. "github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/timeutc"
@@ -80,14 +82,18 @@ type RestoreRun struct {
 	SnapshotTag  string
 	Stage        RestoreStage
 
-	Units []RestoreUnit // cache that's initialized once for entire task
+	RepairTaskID uuid.UUID // task ID of the automated post-restore repair
+
+	// Cache that's initialized once for entire task
+	Units []RestoreUnit
+	Views []RestoreView
 }
 
 // RestoreUnit represents restored keyspace and its tables with their size.
 type RestoreUnit struct {
-	Keyspace string `db:"keyspace_name"`
-	Size     int64
-	Tables   []RestoreTable
+	Keyspace string         `json:"keyspace" db:"keyspace_name"`
+	Size     int64          `json:"size"`
+	Tables   []RestoreTable `json:"tables"`
 }
 
 func (u RestoreUnit) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error) {
@@ -100,10 +106,11 @@ func (u *RestoreUnit) UnmarshalUDT(name string, info gocql.TypeInfo, data []byte
 	return gocql.Unmarshal(info, data, f.Addr().Interface())
 }
 
-// RestoreTable represents restored table and its size.
+// RestoreTable represents restored table, its size and original tombstone_gc mode.
 type RestoreTable struct {
-	Table string `db:"table_name"`
-	Size  int64
+	Table       string          `json:"table" db:"table_name"`
+	TombstoneGC tombstoneGCMode `json:"tombstone_gc"`
+	Size        int64           `json:"size"`
 }
 
 func (t RestoreTable) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error) {
@@ -112,6 +119,34 @@ func (t RestoreTable) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, erro
 }
 
 func (t *RestoreTable) UnmarshalUDT(name string, info gocql.TypeInfo, data []byte) error {
+	f := gocqlx.DefaultMapper.FieldByName(reflect.ValueOf(t), name)
+	return gocql.Unmarshal(info, data, f.Addr().Interface())
+}
+
+// ViewType either Materialized View or Secondary Index.
+type ViewType string
+
+// ViewType enumeration.
+const (
+	MaterializedView ViewType = "MaterializedView"
+	SecondaryIndex   ViewType = "SecondaryIndex"
+)
+
+// RestoreView represents statement used for recreating restored (dropped) views.
+type RestoreView struct {
+	Keyspace   string   `json:"keyspace" db:"keyspace_name"`
+	View       string   `json:"view" db:"view_name"`
+	Type       ViewType `json:"type" db:"view_type"`
+	BaseTable  string   `json:"base_table"`
+	CreateStmt string   `json:"create_stmt"`
+}
+
+func (t RestoreView) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error) {
+	f := gocqlx.DefaultMapper.FieldByName(reflect.ValueOf(t), name)
+	return gocql.Marshal(info, f.Interface())
+}
+
+func (t *RestoreView) UnmarshalUDT(name string, info gocql.TypeInfo, data []byte) error {
 	f := gocqlx.DefaultMapper.FieldByName(reflect.ValueOf(t), name)
 	return gocql.Unmarshal(info, data, f.Addr().Interface())
 }
@@ -167,9 +202,11 @@ type restoreProgress struct {
 // RestoreProgress groups restore progress for all restored keyspaces.
 type RestoreProgress struct {
 	restoreProgress
+	RepairProgress *repair.Progress `json:"repair_progress"`
 
 	SnapshotTag string                    `json:"snapshot_tag"`
 	Keyspaces   []RestoreKeyspaceProgress `json:"keyspaces,omitempty"`
+	Views       []RestoreViewProgress     `json:"views,omitempty"`
 	Stage       RestoreStage              `json:"stage"`
 }
 
@@ -185,6 +222,14 @@ type RestoreKeyspaceProgress struct {
 type RestoreTableProgress struct {
 	restoreProgress
 
-	Table string `json:"table"`
-	Error string `json:"error,omitempty"`
+	Table       string          `json:"table"`
+	TombstoneGC tombstoneGCMode `json:"tombstone_gc"`
+	Error       string          `json:"error,omitempty"`
+}
+
+// RestoreViewProgress defines restore progress for the view.
+type RestoreViewProgress struct {
+	RestoreView
+
+	Status scyllaclient.ViewBuildStatus `json:"status"`
 }

@@ -37,13 +37,17 @@ type ClusterSlice []*models.Cluster
 
 // Render renders ClusterSlice in a tabular format.
 func (cs ClusterSlice) Render(w io.Writer) error {
-	t := table.New("ID", "Name", "Port")
+	t := table.New("ID", "Name", "Port", "CQL credentials")
 	for _, c := range cs {
 		p := "default"
 		if c.Port != 0 {
 			p = fmt.Sprint(c.Port)
 		}
-		t.AddRow(c.ID, c.Name, p)
+		creds := "not set"
+		if c.Username != "" && c.Password != "" {
+			creds = "set"
+		}
+		t.AddRow(c.ID, c.Name, p, creds)
 	}
 	if _, err := w.Write([]byte(t.String())); err != nil {
 		return err
@@ -429,11 +433,16 @@ Cron:	{{ .Schedule.Cron }} {{ CronDesc .Schedule.Cron }}
 Tz:	{{ .Schedule.Timezone }}
 {{ end }}
 {{ end -}}
-Keyspaces:
+Restored tables:
 {{- range .Units }}
   - {{ .Keyspace }}: {{ FormatSizeSuffix .Size }} {{ FormatRestoreTables .Tables }}
 {{- end }}
-
+{{ if .Views }}
+Restored views:
+{{- range .Views }}
+  - {{ .Keyspace }}.{{ .View }}
+{{- end }}
+{{ end }}
 Disk size: ~{{ FormatSizeSuffix .Size }}
 
 Locations:
@@ -684,10 +693,10 @@ End time:	{{ FormatTime .EndTime }}
 Duration:	{{ FormatDuration .StartTime .EndTime }} 
 {{- end }}
 {{- with .Progress }}
-Progress:	{{ FormatRepairProgress .TokenRanges .Success .Error }}
+Progress:	{{ FormatTotalRepairProgress .SuccessPercentage .ErrorPercentage }}
 {{- if isRunning }}
-Intensity:	{{ .Intensity }}
-Parallel:	{{ .Parallel }}
+Intensity:	{{ FormatRepairIntensity .Intensity .MaxIntensity }}
+Parallel:	{{ FormatRepairParallel .Parallel .MaxParallel }}
 {{- end }}
 {{ if .Host }}Host:	{{ .Host }}
 {{ end -}}
@@ -702,12 +711,15 @@ Progress:	-
 
 func (rp RepairProgress) addHeader(w io.Writer) error {
 	temp := template.Must(template.New("repair_progress").Funcs(template.FuncMap{
-		"isZero":               isZero,
-		"isRunning":            rp.isRunning,
-		"FormatTime":           FormatTime,
-		"FormatDuration":       FormatDuration,
-		"FormatError":          FormatError,
-		"FormatRepairProgress": FormatRepairProgress,
+		"isZero":                    isZero,
+		"isRunning":                 rp.isRunning,
+		"FormatTime":                FormatTime,
+		"FormatDuration":            FormatDuration,
+		"FormatError":               FormatError,
+		"FormatRepairProgress":      FormatRepairProgress,
+		"FormatTotalRepairProgress": FormatTotalRepairProgress,
+		"FormatRepairIntensity":     FormatRepairIntensity,
+		"FormatRepairParallel":      FormatRepairParallel,
 	}).Parse(repairProgressTemplate))
 	return temp.Execute(w, rp)
 }
@@ -957,7 +969,7 @@ func (bp BackupProgress) addHeader(w io.Writer) error {
 func (bp BackupProgress) status() string {
 	stage := BackupStageName(bp.Progress.Stage)
 	s := bp.Run.Status
-	if s != "NEW" && s != "DONE" && stage != "" {
+	if s != TaskStatusNew && s != TaskStatusDone && stage != "" {
 		s += " (" + stage + ")"
 	}
 	return s
@@ -989,10 +1001,9 @@ End time:	{{ FormatTime .EndTime }}
 Duration:	{{ FormatDuration .StartTime .EndTime }}
 {{ end -}}
 {{ with .Progress }}Progress:	{{ if ne .Size 0 }}{{ FormatRestoreProgress .Size .Restored .Downloaded .Failed }}{{else}}-{{ end }}
-{{- if ne .SnapshotTag "" }}
 Snapshot Tag:	{{ .SnapshotTag }}
-{{- end }}
-{{ end -}}
+{{ else }}Progress:	0%
+{{ end }}
 {{- if .Errors -}}
 Errors:	{{ range .Errors }}
   - {{ . }}
@@ -1015,11 +1026,17 @@ func (rp RestoreProgress) addHeader(w io.Writer) error {
 // status returns task status with optional restore stage.
 func (rp RestoreProgress) status() string {
 	s := rp.Run.Status
-	if s == "DONE" {
+	if rp.Progress == nil {
+		return s
+	}
+	if s == TaskStatusDone {
 		if len(rp.Progress.Keyspaces) == 1 && rp.Progress.Keyspaces[0].Keyspace == "system_schema" {
 			return "DONE - restart required (see restore docs)"
 		}
-		return "DONE - tombstone_gc mode reset and repair required (see restore docs)"
+	}
+	stage := RestoreStageName(rp.Progress.Stage)
+	if s != TaskStatusNew && s != TaskStatusDone && stage != "" {
+		s += " (" + stage + ")"
 	}
 	return s
 }
@@ -1033,11 +1050,17 @@ func (rp RestoreProgress) hideKeyspace(keyspace string) bool {
 
 // Render renders *RestoreProgress in a tabular format.
 func (rp RestoreProgress) Render(w io.Writer) error {
+	if rp.Progress != nil {
+		fmt.Fprintf(w, "Restore progress\n")
+	}
 	if err := rp.addHeader(w); err != nil {
 		return err
 	}
+	if rp.Progress == nil {
+		return nil
+	}
 
-	if rp.Progress != nil && rp.Progress.Size > 0 {
+	if rp.Progress.Size > 0 {
 		t := table.New()
 		rp.addKeyspaceProgress(t)
 		if _, err := io.WriteString(w, t.String()); err != nil {
@@ -1045,11 +1068,33 @@ func (rp RestoreProgress) Render(w io.Writer) error {
 		}
 	}
 
-	if rp.Detailed && rp.Progress != nil && rp.Progress.Size > 0 {
+	if rp.Detailed && rp.Progress.Size > 0 {
 		if err := rp.addTableProgress(w); err != nil {
 			return err
 		}
 	}
+
+	// Check if there is repair progress to display
+	if rp.Progress.RepairProgress != nil {
+		fmt.Fprintf(w, "\nPost-restore repair progress\n")
+
+		repairRunPr := &models.TaskRunRepairProgress{
+			Progress: rp.Progress.RepairProgress,
+			Run:      rp.Run,
+		}
+		repairPr := RepairProgress{
+			TaskRunRepairProgress: repairRunPr,
+			Task:                  rp.Task,
+			Detailed:              rp.Detailed,
+			keyspaceFilter:        rp.KeyspaceFilter,
+		}
+
+		if err := repairPr.Render(w); err != nil {
+			return err
+		}
+	}
+
+	rp.addViewProgress(w)
 	return nil
 }
 
@@ -1081,7 +1126,7 @@ func (rp RestoreProgress) addTableProgress(w io.Writer) error {
 		}
 		fmt.Fprintf(w, "\nKeyspace: %s\n", ks.Keyspace)
 
-		t := table.New("Table", "Progress", "Size", "Success", "Downloaded", "Failed", "Started at", "Completed at")
+		t := table.New("Table", "Progress", "Size", "Success", "Downloaded", "Failed", "Started at", "Completed at", "tombstone_gc mode")
 		for i, tab := range ks.Tables {
 			if i > 0 {
 				t.AddSeparator()
@@ -1107,6 +1152,7 @@ func (rp RestoreProgress) addTableProgress(w io.Writer) error {
 				FormatSizeSuffix(tab.Failed),
 				FormatTime(startedAt),
 				FormatTime(completedAt),
+				tab.TombstoneGc,
 			)
 		}
 		t.SetColumnAlignment(termtables.AlignRight, 1, 2, 3, 4, 5)
@@ -1115,6 +1161,21 @@ func (rp RestoreProgress) addTableProgress(w io.Writer) error {
 		}
 	}
 	return nil
+}
+
+func (rp RestoreProgress) addViewProgress(w io.Writer) {
+	if len(rp.Progress.Views) == 0 {
+		return
+	}
+
+	_, _ = fmt.Fprintf(w, "\nRestored views\n")
+	for _, v := range rp.Progress.Views {
+		if rp.Detailed {
+			_, _ = fmt.Fprintf(w, "View: %s.%s, Status: %s, Schema definition:\n  %s\n", v.Keyspace, v.View, v.Status, v.CreateStmt)
+		} else {
+			_, _ = fmt.Fprintf(w, "View: %s.%s, Status: %s\n", v.Keyspace, v.View, v.Status)
+		}
+	}
 }
 
 // ValidateBackupProgress prints validate_backup task progress.

@@ -4,7 +4,6 @@ services:
   dc1_node_1:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-rackdc.1.properties
@@ -20,12 +19,11 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.11
+      second:
 
   dc1_node_2:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-rackdc.1.properties
@@ -41,12 +39,11 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.12
+      second:
 
   dc1_node_3:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-rackdc.1.properties
@@ -62,12 +59,11 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.13
+      second:
 
   dc2_node_1:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-rackdc.2.properties
@@ -83,12 +79,11 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.21
+      second:
 
   dc2_node_2:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-rackdc.2.properties
@@ -104,12 +99,11 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.22
+      second:
 
   dc2_node_3:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-rackdc.2.properties
@@ -125,12 +119,11 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.23
+      second:
 
   second_cluster_dc1_node_1:
     image: scylladb/scylla-agent:${SCYLLA_VERSION}
     privileged: true
-    command: ${SCYLLA_SECOND_CLUSTER_ARGS}
     volumes:
       - type: bind
         source: ./scylla/cassandra-second-cluster.properties
@@ -146,17 +139,42 @@ services:
         target: /root/.cassandra/cqlshrc
     networks:
       public:
-        ipv4_address: 192.168.100.30
+      second:
+
+  second_cluster_dc1_node_2:
+    image: scylladb/scylla-agent:${SCYLLA_VERSION}
+    privileged: true
+    volumes:
+      - type: bind
+        source: ./scylla/cassandra-second-cluster.properties
+        target: /etc/scylla/cassandra-rackdc.properties
+      - type: bind
+        source: ./scylla/scylla-second-cluster.yaml
+        target: /etc/scylla/scylla.yaml
+      - type: bind
+        source: ./scylla/certs/
+        target: /etc/scylla/certs
+      - type: bind
+        source: ./scylla/cqlshrc
+        target: /root/.cassandra/cqlshrc
+    networks:
+      public:
+      second:
 
   scylla-manager-db:
     image: ${SCYLLA_IMAGE}:${SCYLLA_VERSION}
-    command: --smp 1 --memory 500M --api-address 0.0.0.0
     ports:
       - "9042:9042"
       - "10000:10000"
+    volumes:
+      - type: bind
+        source: ./scylla/cassandra-second-cluster.properties
+        target: /etc/scylla/cassandra-rackdc.properties
+      - type: bind
+        source: ./scylla/scylla-sm.yaml
+        target: /etc/scylla/scylla.yaml
     networks:
-      public:
-        ipv4_address: 192.168.100.100
+      second:
 
   minio:
     image: minio/minio:${MINIO_VERSION}
@@ -175,25 +193,21 @@ services:
       - "9000:9000"
       - "9001:9001"
     networks:
-      public:
-        ipv4_address: 192.168.100.99
+      second:
 
   prometheus:
     image: prom/prometheus:${PROMETHEUS_VERSION}
-    volumes:
-      - type: bind
-        source: ./prometheus/prometheus.yaml
-        target: /etc/prometheus/prometheus.yml
     ports:
       - "9090:9090"
     networks:
-      public:
-        ipv4_address: 192.168.100.98
+      second:
 
 networks:
   public:
     driver: bridge
     ipam:
       driver: default
-      config:
-        - subnet: 192.168.100.0/24
+  second:
+    driver: bridge
+    ipam:
+      driver: default

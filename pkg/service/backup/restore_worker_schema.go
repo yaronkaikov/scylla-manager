@@ -5,12 +5,12 @@ package backup
 import (
 	"context"
 	"path"
-	"strconv"
 
 	"github.com/pkg/errors"
 	"go.uber.org/atomic"
 
 	. "github.com/scylladb/scylla-manager/v3/pkg/service/backup/backupspec"
+	"github.com/scylladb/scylla-manager/v3/pkg/sstable"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/parallel"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/timeutc"
 )
@@ -18,10 +18,9 @@ import (
 type schemaWorker struct {
 	restoreWorkerTools
 
-	hosts           []string
-	generationCnt   atomic.Int64
-	renamedSSTables map[string]string
-	miwc            ManifestInfoWithContent // Currently restored manifest
+	hosts         []string
+	generationCnt atomic.Int64
+	miwc          ManifestInfoWithContent // Currently restored manifest
 	// Maps original SSTable name to its existing older version (with respect to currently restored snapshot tag)
 	// that should be used during the restore procedure. It should be initialized per each restored table.
 	versionedFiles VersionedMap
@@ -37,17 +36,20 @@ type schemaWorker struct {
 // - schema restoration does not use long polling for updating download progress
 // Adding the ability to resume schema restoration might be added in the future.
 func (w *schemaWorker) restore(ctx context.Context, run *RestoreRun, target RestoreTarget) error {
-	w.AwaitSchemaAgreement(ctx, w.clusterSession)
+	return errors.Wrap(w.stageRestoreData(ctx, run, target), "restore data")
+}
 
+func (w *schemaWorker) stageRestoreData(ctx context.Context, run *RestoreRun, target RestoreTarget) error {
+	run.Stage = StageRestoreData
+	w.insertRun(ctx, run)
+
+	w.AwaitSchemaAgreement(ctx, w.clusterSession)
 	w.Logger.Info(ctx, "Started restoring schema")
 	defer w.Logger.Info(ctx, "Restoring schema finished")
 
 	status, err := w.Client.Status(ctx)
 	if err != nil {
 		return errors.Wrap(err, "get status")
-	}
-	if len(status) != len(status.Live()) {
-		return errors.New("not all nodes are in the UN state")
 	}
 	// Clean upload dirs.
 	// This is required as we rename SSTables during download in order to avoid name overlaps.
@@ -68,7 +70,7 @@ func (w *schemaWorker) restore(ctx context.Context, run *RestoreRun, target Rest
 	}
 	// Download files
 	for _, l := range target.Location {
-		if err = w.locationDownloadHandler(ctx, run, target, l); err != nil {
+		if err := w.locationDownloadHandler(ctx, run, target, l); err != nil {
 			return err
 		}
 	}
@@ -97,7 +99,7 @@ func (w *schemaWorker) restore(ctx context.Context, run *RestoreRun, target Rest
 		)
 	}
 
-	if err = parallel.Run(len(status), parallel.NoLimit, f, notify); err != nil {
+	if err := parallel.Run(len(status), parallel.NoLimit, f, notify); err != nil {
 		return err
 	}
 	// Set restore completed in all run progresses
@@ -105,7 +107,6 @@ func (w *schemaWorker) restore(ctx context.Context, run *RestoreRun, target Rest
 		pr.setRestoreCompletedAt()
 		w.insertRunProgress(ctx, pr)
 	})
-
 	return nil
 }
 
@@ -132,7 +133,7 @@ func (w *schemaWorker) locationDownloadHandler(ctx context.Context, run *Restore
 
 	manifestDownloadHandler := func(miwc ManifestInfoWithContent) error {
 		w.Logger.Info(ctx, "Downloading schema from manifest", "manifest", miwc.ManifestInfo)
-		defer w.Logger.Info(ctx, "Downloading schema from manifest", "manifest", miwc.ManifestInfo)
+		defer w.Logger.Info(ctx, "Downloading schema from manifest finished", "manifest", miwc.ManifestInfo)
 
 		w.miwc = miwc
 		run.ManifestPath = miwc.Path()
@@ -163,17 +164,28 @@ func (w *schemaWorker) workFunc(ctx context.Context, run *RestoreRun, target Res
 		"files", fm.Files,
 	)
 
-	w.initRenamedID(fm.Files)
 	w.versionedFiles, err = ListVersionedFiles(ctx, w.Client, w.SnapshotTag, w.hosts[0], srcDir, w.Logger)
 	if err != nil {
 		return errors.Wrap(err, "initialize versioned SSTables")
 	}
 
+	idMapping := w.getFileNamesMapping(fm.Files, false)
+	uuidMapping := w.getFileNamesMapping(fm.Files, true)
+
 	f := func(i int) error {
 		host := w.hosts[i]
+		nodeInfo, err := w.Client.NodeInfo(ctx, host)
+		if err != nil {
+			return errors.Wrapf(err, "get node info on host %s", host)
+		}
+
+		renamedSSTables := idMapping
+		if nodeInfo.SstableUUIDFormat {
+			renamedSSTables = uuidMapping
+		}
 
 		if err := w.checkAvailableDiskSpace(ctx, hostInfo{IP: host}); err != nil {
-			return errors.Wrapf(err, "validate free disk space on host: %s", host)
+			return errors.Wrapf(err, "validate free disk space on host %s", host)
 		}
 
 		start := timeutc.Now()
@@ -181,7 +193,7 @@ func (w *schemaWorker) workFunc(ctx context.Context, run *RestoreRun, target Res
 		fHost := func(j int) error {
 			file := fm.Files[j]
 			// Rename SSTable in the destination in order to avoid name conflicts
-			dstFile := w.renamedSSTables[file]
+			dstFile := renamedSSTables[file]
 			// Take the correct version of restored file
 			srcFile := file
 			if v, ok := w.versionedFiles[file]; ok {
@@ -203,7 +215,7 @@ func (w *schemaWorker) workFunc(ctx context.Context, run *RestoreRun, target Res
 		}
 
 		// Rely on rclone ability to limit number of concurrent transfers
-		err := parallel.Run(len(fm.Files), parallel.NoLimit, fHost, notifyHost)
+		err = parallel.Run(len(fm.Files), parallel.NoLimit, fHost, notifyHost)
 		if err != nil {
 			return errors.Wrapf(err, "download renamed SSTables on host: %s", host)
 		}
@@ -245,34 +257,25 @@ func (w *schemaWorker) initHosts(ctx context.Context) error {
 	}
 
 	remotePath := w.location.RemotePath("")
-	checkedNodes, err := w.Client.GetLiveNodesWithLocationAccess(ctx, status, remotePath)
+	nodes, err := w.Client.GetNodesWithLocationAccess(ctx, status, remotePath)
 	if err != nil {
 		return errors.Wrap(err, "no live nodes with location access")
 	}
 
 	w.hosts = make([]string, 0)
-	for _, host := range checkedNodes {
-		w.hosts = append(w.hosts, host.Addr)
+	for _, n := range nodes {
+		w.hosts = append(w.hosts, n.Addr)
 	}
 
 	w.Logger.Info(ctx, "Initialized restore hosts", "hosts", w.hosts)
 	return nil
 }
 
-func (w *schemaWorker) initRenamedID(sstables []string) {
-	bundles := make(map[string][]string)
-	for _, sst := range sstables {
-		id := sstableID(sst)
-		bundles[id] = append(bundles[id], sst)
+// getFileNamesMapping creates renaming mapping for the sstables solving problems with sstables file names.
+func (w *schemaWorker) getFileNamesMapping(sstables []string, sstableUUIDFormat bool) map[string]string {
+	if sstableUUIDFormat {
+		// Target naming scheme is UUID-like
+		return sstable.RenameToUUIDs(sstables)
 	}
-
-	w.renamedSSTables = make(map[string]string)
-	for _, b := range bundles {
-		newID := int(w.generationCnt.Add(1))
-		for _, sst := range b {
-			w.renamedSSTables[sst] = renameSSTableID(sst, strconv.Itoa(newID))
-		}
-	}
+	return sstable.RenameToIDs(sstables, &w.generationCnt)
 }
-
-func (w *schemaWorker) continuePrevRun() {}

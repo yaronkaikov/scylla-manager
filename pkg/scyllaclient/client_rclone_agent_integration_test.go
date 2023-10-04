@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	. "github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
 	"path"
 	"strings"
 	"testing"

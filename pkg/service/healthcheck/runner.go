@@ -47,6 +47,7 @@ type runner struct {
 	timeout      time.Duration
 	metrics      *runnerMetrics
 	ping         func(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration) (rtt time.Duration, err error)
+	pingAgent    func(ctx context.Context, clusterID uuid.UUID, host string, timeout time.Duration) (rtt time.Duration, err error)
 }
 
 type runnerMetrics struct {
@@ -54,7 +55,7 @@ type runnerMetrics struct {
 	rtt    *prometheus.GaugeVec
 }
 
-func (r runner) Run(ctx context.Context, clusterID, taskID, runID uuid.UUID, properties json.RawMessage) (err error) {
+func (r runner) Run(ctx context.Context, clusterID, _, _ uuid.UUID, _ json.RawMessage) (err error) {
 	defer func() {
 		if err != nil {
 			r.removeMetricsForCluster(clusterID)
@@ -90,7 +91,13 @@ func (r runner) checkHosts(ctx context.Context, clusterID uuid.UUID, status []sc
 
 		rtt, err := r.ping(ctx, clusterID, status[i].Addr, r.timeout)
 		if err != nil {
-			r.metrics.status.With(hl).Set(-1)
+			// Set -2 for unavailable agent and -1 for unavailable Scylla
+			_, err := r.pingAgent(ctx, clusterID, status[i].Addr, r.timeout)
+			if err != nil {
+				r.metrics.status.With(hl).Set(-2)
+			} else {
+				r.metrics.status.With(hl).Set(-1)
+			}
 		} else {
 			r.metrics.status.With(hl).Set(1)
 		}

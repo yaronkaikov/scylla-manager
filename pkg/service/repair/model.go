@@ -3,10 +3,9 @@
 package repair
 
 import (
-	"sort"
 	"time"
 
-	"github.com/scylladb/go-set/iset"
+	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/inexlist/ksfilter"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/uuid"
 )
@@ -25,6 +24,9 @@ type Target struct {
 	Intensity           float64  `json:"intensity"`
 	Parallel            int      `json:"parallel"`
 	SmallTableThreshold int64    `json:"small_table_threshold"`
+	// Cache for repair plan so that it does not have to be generated
+	// in both GetTarget and Repair functions.
+	plan *plan `json:"-"`
 }
 
 // taskProperties is the main data structure of the runner.Properties blob.
@@ -42,8 +44,11 @@ type taskProperties struct {
 
 func defaultTaskProperties() *taskProperties {
 	return &taskProperties{
+		// Don't repair system_traces unless it has been deliberately specified.
+		Keyspace: []string{"*", "!system_traces"},
+
 		Continue:  true,
-		Intensity: 1,
+		Intensity: defaultIntensity,
 
 		// Consider 1GB table as small by default.
 		SmallTableThreshold: 1 * 1024 * 1024 * 1024,
@@ -60,6 +65,7 @@ type Run struct {
 	Host      string
 	PrevID    uuid.UUID
 	StartTime time.Time
+	EndTime   time.Time
 }
 
 // RunProgress specifies repair progress of a run for a table.
@@ -71,6 +77,7 @@ type RunProgress struct {
 	Keyspace  string `db:"keyspace_name"`
 	Table     string `db:"table_name"`
 
+	Size        int64
 	TokenRanges int64
 	Success     int64
 	Error       int64
@@ -87,16 +94,12 @@ func (rp *RunProgress) Completed() bool {
 	return rp.TokenRanges == rp.Success+rp.Error
 }
 
-// CurrentDuration returns duration which includes elapsed time for uncompleted
-// jobs.
+// CurrentDuration returns duration which includes elapsed time for uncompleted jobs.
 // now parameter is used as reference point.
 func (rp *RunProgress) CurrentDuration(now time.Time) time.Duration {
-	// Checking if run progress is started (StartedAt) and if a job is started
-	// (DurationStartedAt).
-	if rp.StartedAt != nil && rp.DurationStartedAt != nil {
+	if isTimeSet(rp.StartedAt) && isTimeSet(rp.DurationStartedAt) {
 		return rp.Duration + now.Sub(*rp.DurationStartedAt)
 	}
-
 	return rp.Duration
 }
 
@@ -109,35 +112,12 @@ func (rp *RunProgress) AddDuration(end time.Time) {
 // RunState represents state of the repair.
 // Used for resuming repair task from the last known state.
 type RunState struct {
-	ClusterID uuid.UUID
-	TaskID    uuid.UUID
-	RunID     uuid.UUID
-	Keyspace  string `db:"keyspace_name"`
-	Table     string `db:"table_name"`
-
-	SuccessPos []int
-	ErrorPos   []int
-}
-
-// UpdatePositions updates SuccessPos and ErrorPos according to job result.
-func (rs *RunState) UpdatePositions(job jobResult) {
-	errorPos := iset.New(rs.ErrorPos...)
-	successPos := iset.New(rs.SuccessPos...)
-	for _, tr := range job.Ranges {
-		if job.Err != nil {
-			if tr.Keyspace == rs.Keyspace && tr.Table == rs.Table {
-				errorPos.Add(tr.Pos)
-			}
-		} else {
-			if tr.Keyspace == rs.Keyspace && tr.Table == rs.Table {
-				successPos.Add(tr.Pos)
-			}
-		}
-	}
-	rs.ErrorPos = errorPos.List()
-	sort.Ints(rs.ErrorPos)
-	rs.SuccessPos = successPos.List()
-	sort.Ints(rs.SuccessPos)
+	ClusterID     uuid.UUID
+	TaskID        uuid.UUID
+	RunID         uuid.UUID
+	Keyspace      string                    `db:"keyspace_name"`
+	Table         string                    `db:"table_name"`
+	SuccessRanges []scyllaclient.TokenRange `db:"success_ranges"`
 }
 
 // progress holds generic progress data, it's a base type for other progress
@@ -151,21 +131,15 @@ type progress struct {
 	Duration    int64      `json:"duration_ms"`
 }
 
-// ProgressPercentage returns repair progress percentage based on token ranges.
+// PercentComplete returns repair progress percentage based on token ranges.
 func (p progress) PercentComplete() int {
 	if p.TokenRanges == 0 {
 		return 0
 	}
-
-	if p.Success >= p.TokenRanges {
-		return 100
-	}
-
 	percent := 100 * p.Success / p.TokenRanges
-	if percent >= 100 {
-		percent = 99
+	if percent > 100 {
+		percent = 100
 	}
-
 	return int(percent)
 }
 
@@ -187,10 +161,18 @@ type TableProgress struct {
 // separately.
 type Progress struct {
 	progress
-	DC        []string        `json:"dcs"`
-	Host      string          `json:"host"`
-	Hosts     []HostProgress  `json:"hosts"`
-	Tables    []TableProgress `json:"tables"`
-	Intensity float64         `json:"intensity"`
-	Parallel  int             `json:"parallel"`
+	SuccessPercentage int             `json:"success_percentage"`
+	ErrorPercentage   int             `json:"error_percentage"`
+	DC                []string        `json:"dcs"`
+	Host              string          `json:"host"`
+	Hosts             []HostProgress  `json:"hosts"`
+	Tables            []TableProgress `json:"tables"`
+	MaxIntensity      float64         `json:"max_intensity"`
+	Intensity         float64         `json:"intensity"`
+	MaxParallel       int             `json:"max_parallel"`
+	Parallel          int             `json:"parallel"`
+}
+
+func isTimeSet(t *time.Time) bool {
+	return t != nil && !t.IsZero()
 }

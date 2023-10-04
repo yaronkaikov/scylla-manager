@@ -3,11 +3,12 @@
 package scyllaclient
 
 import (
-	"strings"
+	"reflect"
 
+	"github.com/gocql/gocql"
 	"github.com/scylladb/go-set/strset"
+	"github.com/scylladb/gocqlx/v2"
 	"github.com/scylladb/scylla-manager/v3/pkg/util/slice"
-	"github.com/scylladb/scylla-manager/v3/swagger/gen/scylla/v1/models"
 )
 
 // NodeStatus represents nodetool Status=Up/Down.
@@ -77,6 +78,26 @@ func (s NodeStatusInfoSlice) Datacenter(dcs []string) NodeStatusInfoSlice {
 	})
 }
 
+// DatacenterMap returns dc to nodes mapping.
+func (s NodeStatusInfoSlice) DatacenterMap(dc []string) map[string][]string {
+	dcMap := make(map[string][]string)
+	for _, h := range s {
+		if slice.ContainsString(dc, h.Datacenter) {
+			dcMap[h.Datacenter] = append(dcMap[h.Datacenter], h.Addr)
+		}
+	}
+	return dcMap
+}
+
+// HostDC returns node to dc mapping.
+func (s NodeStatusInfoSlice) HostDC() map[string]string {
+	hostDC := make(map[string]string)
+	for _, h := range s {
+		hostDC[h.Addr] = h.Datacenter
+	}
+	return hostDC
+}
+
 // Up returns sub slice containing only nodes with status up.
 func (s NodeStatusInfoSlice) Up() NodeStatusInfoSlice {
 	return s.filter(func(i int) bool {
@@ -143,12 +164,7 @@ const (
 	CommandFailed     CommandStatus = "FAILED"
 )
 
-// Partitioners.
-const (
-	Murmur3Partitioner = "org.apache.cassandra.dht.Murmur3Partitioner"
-)
-
-// ReplicationStrategy specifies type of a keyspace replication strategy.
+// ReplicationStrategy specifies type of keyspace replication strategy.
 type ReplicationStrategy string
 
 // Replication strategies.
@@ -160,9 +176,9 @@ const (
 
 // Ring describes token ring of a keyspace.
 type Ring struct {
-	Tokens      []TokenRange
-	HostDC      map[string]string
-	Replication ReplicationStrategy
+	ReplicaTokens []ReplicaTokenRanges
+	HostDC        map[string]string
+	Replication   ReplicationStrategy
 }
 
 // Datacenters returns a list of datacenters the keyspace is replicated in.
@@ -174,23 +190,26 @@ func (r Ring) Datacenters() []string {
 	return v.List()
 }
 
-// HostTokenRanges returns a list of token ranges given host is a replica.
-// It returns pairs of token range start and end.
-func (r Ring) HostTokenRanges(host string) []int64 {
-	var tr []int64
-	for _, t := range r.Tokens {
-		if slice.ContainsString(t.Replicas, host) {
-			tr = append(tr, t.StartToken, t.EndToken)
-		}
-	}
-	return tr
+// TokenRange describes the beginning and end of a token range.
+type TokenRange struct {
+	StartToken int64 `db:"start_token"`
+	EndToken   int64 `db:"end_token"`
 }
 
-// TokenRange describes replicas of a token (range).
-type TokenRange struct {
-	StartToken int64
-	EndToken   int64
-	Replicas   []string
+func (t TokenRange) MarshalUDT(name string, info gocql.TypeInfo) ([]byte, error) {
+	f := gocqlx.DefaultMapper.FieldByName(reflect.ValueOf(t), name)
+	return gocql.Marshal(info, f.Interface())
+}
+
+func (t *TokenRange) UnmarshalUDT(name string, info gocql.TypeInfo, data []byte) error {
+	f := gocqlx.DefaultMapper.FieldByName(reflect.ValueOf(t), name)
+	return gocql.Unmarshal(info, data, f.Addr().Interface())
+}
+
+// ReplicaTokenRanges describes all token ranges belonging to given replica set.
+type ReplicaTokenRanges struct {
+	ReplicaSet []string     // Sorted lexicographically
+	Ranges     []TokenRange // Sorted by start token
 }
 
 // Unit describes keyspace and some tables in that keyspace.
@@ -199,43 +218,26 @@ type Unit struct {
 	Tables   []string
 }
 
-// ScyllaFeatures specifies features supported by the Scylla version.
-type ScyllaFeatures struct {
-	RowLevelRepair    bool
-	RepairLongPolling bool
+// ViewBuildStatus defines build status of a view.
+type ViewBuildStatus string
+
+// ViewBuildStatus enumeration.
+const (
+	StatusUnknown ViewBuildStatus = "UNKNOWN"
+	StatusStarted ViewBuildStatus = "STARTED"
+	StatusSuccess ViewBuildStatus = "SUCCESS"
+)
+
+// ViewBuildStatusOrder lists all view build statuses in the order of their execution.
+func ViewBuildStatusOrder() []ViewBuildStatus {
+	return []ViewBuildStatus{
+		StatusUnknown,
+		StatusStarted,
+		StatusSuccess,
+	}
 }
 
-type gossipApplicationState int32
-
-const (
-	// Reference: https://github.com/scylladb/scylla/blob/master/gms/application_state.hh
-
-	gossipSupportedFeatures gossipApplicationState = 14
-)
-
-type featureFlag = string
-
-const (
-	rowLevelRepair featureFlag = "ROW_LEVEL_REPAIR"
-)
-
-func makeScyllaFeatures(endpointStates []*models.EndpointState) map[string]ScyllaFeatures {
-	supportedFeatures := make(map[string][]string, len(endpointStates))
-
-	for _, state := range endpointStates {
-		for _, as := range state.ApplicationState {
-			if gossipApplicationState(as.ApplicationState) == gossipSupportedFeatures {
-				supportedFeatures[state.Addrs] = strings.Split(as.Value, ",")
-			}
-		}
-	}
-
-	sfs := make(map[string]ScyllaFeatures, len(supportedFeatures))
-	for host, sf := range supportedFeatures {
-		sfs[host] = ScyllaFeatures{
-			RowLevelRepair: slice.ContainsString(sf, rowLevelRepair),
-		}
-	}
-
-	return sfs
+// Index returns status position in ViewBuildStatusOrder.
+func (s ViewBuildStatus) Index() int {
+	return slice.Index(ViewBuildStatusOrder(), s)
 }

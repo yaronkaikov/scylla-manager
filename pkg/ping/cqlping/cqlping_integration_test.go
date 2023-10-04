@@ -8,22 +8,35 @@ package cqlping
 import (
 	"context"
 	"crypto/tls"
+	"github.com/scylladb/scylla-manager/v3/pkg/testutils/testconfig"
 	"testing"
 	"time"
 
+	"github.com/scylladb/go-log"
 	"github.com/scylladb/scylla-manager/v3/pkg/ping"
+	"github.com/scylladb/scylla-manager/v3/pkg/scyllaclient"
+	"github.com/scylladb/scylla-manager/v3/pkg/service/cluster"
 	"github.com/scylladb/scylla-manager/v3/pkg/testutils"
+	"go.uber.org/zap/zapcore"
 )
 
 func TestPingIntegration(t *testing.T) {
-	user, password := testutils.ManagedClusterCredentials()
+	client := newTestClient(t, log.NewDevelopmentWithLevel(zapcore.InfoLevel).Named("client"), nil)
+	defer client.Close()
+
+	sessionHosts, err := cluster.GetRPCAddresses(context.Background(), client, []string{testconfig.ManagedClusterHost()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	user, password := testconfig.ManagedClusterCredentials()
 	config := Config{
-		Addr:    testutils.ManagedClusterHost() + ":9042",
+		Addr:    sessionHosts[0],
 		Timeout: 250 * time.Millisecond,
 	}
 
 	t.Run("simple", func(t *testing.T) {
-		d, err := NativeCQLPing(context.Background(), config)
+		d, err := NativeCQLPing(context.Background(), config, log.NopLogger)
 		if err != nil {
 			t.Error(err)
 		}
@@ -54,7 +67,7 @@ func TestPingTLSIntegration(t *testing.T) {
 	t.SkipNow()
 
 	config := Config{
-		Addr:    testutils.ManagedClusterHost() + ":9042",
+		Addr:    testconfig.ManagedClusterHost() + ":9042",
 		Timeout: 250 * time.Millisecond,
 		TLSConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -62,7 +75,7 @@ func TestPingTLSIntegration(t *testing.T) {
 	}
 
 	t.Run("simple", func(t *testing.T) {
-		d, err := NativeCQLPing(context.Background(), config)
+		d, err := NativeCQLPing(context.Background(), config, log.NopLogger)
 		if err != nil {
 			t.Error(err)
 		}
@@ -76,4 +89,19 @@ func TestPingTLSIntegration(t *testing.T) {
 		}
 		t.Logf("QueryPing() = %s", d)
 	})
+}
+
+func newTestClient(t *testing.T, logger log.Logger, config *scyllaclient.Config) *scyllaclient.Client {
+	t.Helper()
+
+	if config == nil {
+		c := scyllaclient.TestConfig(testconfig.ManagedClusterHosts(), testutils.AgentAuthToken())
+		config = &c
+	}
+
+	c, err := scyllaclient.NewClient(*config, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

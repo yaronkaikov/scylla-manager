@@ -79,13 +79,45 @@ func FormatRepairProgress(total, success, failed int64) string {
 	if total == 0 {
 		return "-"
 	}
-	out := fmt.Sprintf("%.f%%",
-		float64(success)*100/float64(total),
-	)
+	out := fmt.Sprintf("%.f%%", math.Floor(float64(success)*100/float64(total)))
 	if failed > 0 {
-		out += fmt.Sprintf("/%.f%%", float64(failed)*100/float64(total))
+		out += fmt.Sprintf("/%.f%%", math.Ceil(float64(failed)*100/float64(total)))
 	}
 	return out
+}
+
+// FormatTotalRepairProgress returns string representation of weighted repair progress.
+func FormatTotalRepairProgress(successPr, errorPr int64) string {
+	if successPr < 0 || errorPr < 0 {
+		return "-"
+	}
+	out := fmt.Sprintf("%d%%", successPr)
+	if errorPr > 0 {
+		out += fmt.Sprintf("/%d%%", errorPr)
+	}
+	return out
+}
+
+// FormatRepairParallel return string representation of currently used and maximal parallel value.
+func FormatRepairParallel(parallel, maxParallel int64) string {
+	if parallel > maxParallel {
+		parallel = maxParallel
+	}
+	if parallel == 0 {
+		return fmt.Sprintf("%d/%d (max)", maxParallel, maxParallel)
+	}
+	return fmt.Sprintf("%d/%d", parallel, maxParallel)
+}
+
+// FormatRepairIntensity return string representation of currently used and maximal intensity value.
+func FormatRepairIntensity(intensity, maxIntensity float64) string {
+	if intensity > maxIntensity {
+		intensity = maxIntensity
+	}
+	if intensity == 0 {
+		return fmt.Sprintf("%.0f/%.0f (max)", maxIntensity, maxIntensity)
+	}
+	return fmt.Sprintf("%.0f/%.0f", intensity, maxIntensity)
 }
 
 // FormatUploadProgress calculates percentage of success and failed uploads.
@@ -94,11 +126,9 @@ func FormatUploadProgress(size, uploaded, skipped, failed int64) string {
 		return "100%"
 	}
 	transferred := uploaded + skipped
-	out := fmt.Sprintf("%d%%",
-		transferred*100/size,
-	)
+	out := fmt.Sprintf("%.f%%", math.Floor(float64(transferred)*100/float64(size)))
 	if failed > 0 {
-		out += fmt.Sprintf("/%d%%", failed*100/size)
+		out += fmt.Sprintf("/%.f%%", math.Ceil(float64(failed)*100/float64(size)))
 	}
 	return out
 }
@@ -108,10 +138,10 @@ func FormatRestoreProgress(size, restored, downloaded, failed int64) string {
 	if size == 0 {
 		return "100%"
 	}
-	out := fmt.Sprintf("%d%%", restored*100/size)
-	out += fmt.Sprintf(" | %d%%", downloaded*100/size)
+	out := fmt.Sprintf("%.f%%", math.Floor(float64(restored)*100/float64(size)))
+	out += fmt.Sprintf(" | %.f%%", math.Floor(float64(downloaded)*100/float64(size)))
 	if failed > 0 {
-		out += fmt.Sprintf(" / failed: %d%%", failed*100/size)
+		out += fmt.Sprintf(" / failed: %.f%%", math.Ceil(float64(failed)*100/float64(size)))
 	}
 	return out
 }
@@ -126,7 +156,7 @@ func FormatTime(t strfmt.DateTime) string {
 	if isZero(t) {
 		return ""
 	}
-	return time.Time(t).Local().Format(rfc822WithSec)
+	return time.Time(t).Local().Format(rfc822WithSec) //nolint: gosmopolitan
 }
 
 // FormatTimePointer see FormatTime.
