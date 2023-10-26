@@ -1,0 +1,1 @@
+{"project_name":"scylla-manager","tag":"v3.3.0-dev","previous_tag":"3.3.0-dev-0.20231003.ec95eb432","version":"3.3.0-dev","commit":"5a35895c6e000102d7be1b84492df437234c7200","date":"2023-10-26T09:53:43.039134843+03:00","runtime":{"goos":"linux","goarch":"amd64"}}

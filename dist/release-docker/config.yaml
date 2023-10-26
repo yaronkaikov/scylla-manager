@@ -1,0 +1,202 @@
+project_name: scylla-manager
+release:
+  github:
+    owner: yaronkaikov
+    name: scylla-manager
+  name_template: '{{.Tag}}'
+builds:
+  - id: scylla-manager
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - "386"
+    goarm:
+      - "6"
+    gomips:
+      - hardfloat
+    goamd64:
+      - v1
+    targets:
+      - linux_amd64_v1
+      - linux_arm64
+      - linux_386
+      - darwin_amd64_v1
+      - darwin_arm64
+      - windows_amd64_v1
+      - windows_arm64
+      - windows_386
+    dir: .
+    main: .
+    binary: scylla-manager
+    builder: go
+    skip: true
+    gobinary: go
+    command: build
+    ldflags:
+      - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}} -X main.builtBy=goreleaser
+archives:
+  - id: default
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}{{ with .Mips }}_{{ . }}{{ end }}{{ if not (eq .Amd64 "v1") }}{{ .Amd64 }}{{ end }}'
+    format: tar.gz
+    files:
+      - src: license*
+      - src: LICENSE*
+      - src: readme*
+      - src: README*
+      - src: changelog*
+      - src: CHANGELOG*
+snapshot:
+  name_template: '{{ .Version }}-SNAPSHOT-{{ .ShortCommit }}'
+checksum:
+  name_template: checksums
+  algorithm: sha256
+dockers:
+  - ids:
+      - server
+      - client
+    goos: linux
+    goarch: amd64
+    goarm: "6"
+    goamd64: v1
+    dockerfile: docker/scylla-manager.dockerfile
+    image_templates:
+      - scylladb/scylla-manager:{{ .Version }}-x86_64
+    extra_files:
+      - docker/scylla-manager.yaml
+      - release
+    build_flag_templates:
+      - --build-arg=BASE_IMAGE=ubuntu:22.04
+      - --build-arg=ARCH=amd64
+    use: docker
+  - ids:
+      - server
+      - client
+    goos: linux
+    goarch: arm64
+    goarm: "6"
+    goamd64: v1
+    dockerfile: docker/scylla-manager.dockerfile
+    image_templates:
+      - scylladb/scylla-manager:{{ .Version }}-aarch64
+    extra_files:
+      - docker/scylla-manager.yaml
+      - release/
+    build_flag_templates:
+      - --build-arg=BASE_IMAGE=arm64v8/ubuntu:22.04
+      - --build-arg=ARCH=arm64
+    use: docker
+  - ids:
+      - agent
+    goos: linux
+    goarch: amd64
+    goarm: "6"
+    goamd64: v1
+    dockerfile: docker/scylla-manager-agent.dockerfile
+    image_templates:
+      - scylladb/scylla-manager-agent:{{ .Version }}-x86_64
+    extra_files:
+      - docker/scylla-manager.yaml
+      - release
+    build_flag_templates:
+      - --build-arg=BASE_IMAGE=ubuntu:22.04
+      - --build-arg=ARCH=amd64
+    use: docker
+  - ids:
+      - agent
+    goos: linux
+    goarch: arm64
+    goarm: "6"
+    goamd64: v1
+    dockerfile: docker/scylla-manager-agent.dockerfile
+    image_templates:
+      - scylladb/scylla-manager-agent:{{ .Version }}-aarch64
+    extra_files:
+      - docker/scylla-manager.yaml
+      - release
+    build_flag_templates:
+      - --build-arg=BASE_IMAGE=arm64v8/ubuntu:22.04
+      - --build-arg=ARCH=arm64
+    use: docker
+docker_manifests:
+  - id: scylla-manager
+    name_template: scylladb/scylla-manager:{{ .Version }}
+    skip_push: "false"
+    image_templates:
+      - scylladb/scylla-manager:{{ .Version }}-x86_64
+      - scylladb/scylla-manager:{{ .Version }}-aarch64
+    create_flags:
+      - --insecure
+    push_flags:
+      - --insecure
+    use: docker
+  - id: scylla-manager-agent
+    name_template: scylladb/scylla-manager-agent:{{ .Version }}
+    skip_push: "false"
+    image_templates:
+      - scylladb/scylla-manager-agent:{{ .Version }}-x86_64
+      - scylladb/scylla-manager-agent:{{ .Version }}-aarch64
+    create_flags:
+      - --insecure
+    push_flags:
+      - --insecure
+    use: docker
+dist: release-docker
+env_files:
+  github_token: ~/.config/goreleaser/github_token
+  gitlab_token: ~/.config/goreleaser/gitlab_token
+  gitea_token: ~/.config/goreleaser/gitea_token
+source:
+  name_template: '{{ .ProjectName }}-{{ .Version }}'
+  format: tar.gz
+gomod:
+  gobinary: go
+announce:
+  twitter:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+  mastodon:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    server: ""
+  reddit:
+    title_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    url_template: '{{ .ReleaseURL }}'
+  slack:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    username: GoReleaser
+  discord:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    author: GoReleaser
+    color: "3888754"
+    icon_url: https://goreleaser.com/static/avatar.png
+  teams:
+    title_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    color: '#2D313E'
+    icon_url: https://goreleaser.com/static/avatar.png
+  smtp:
+    subject_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    body_template: 'You can view details from: {{ .ReleaseURL }}'
+  mattermost:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+    title_template: '{{ .ProjectName }} {{ .Tag }} is out!'
+    username: GoReleaser
+  linkedin:
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}'
+  telegram:
+    message_template: '{{ .ProjectName }} {{ mdv2escape .Tag }} is out! Check it out at {{ mdv2escape .ReleaseURL }}'
+    parse_mode: MarkdownV2
+  webhook:
+    message_template: '{ "message": "{{ .ProjectName }} {{ .Tag }} is out! Check it out at {{ .ReleaseURL }}"}'
+    content_type: application/json; charset=utf-8
+  opencollective:
+    title_template: '{{ .Tag }}'
+    message_template: '{{ .ProjectName }} {{ .Tag }} is out!<br/>Check it out at <a href="{{ .ReleaseURL }}">{{ .ReleaseURL }}</a>'
+git:
+  tag_sort: -version:refname
+github_urls:
+  download: https://github.com
+gitlab_urls:
+  download: https://gitlab.com

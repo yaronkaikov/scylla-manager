@@ -6,8 +6,8 @@ RUN apt-get update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-COPY scylla-manager-agent*.deb /
-RUN dpkg -i scylla-manager-agent*.deb && rm /scylla-manager-agent*.deb
+COPY release/scylla-manager-agent*$ARCH.deb /
+RUN dpkg -i scylla-manager-agent*$ARCH.deb && rm /scylla-manager-agent*.deb
 
 USER scylla-manager
 ENV HOME /var/lib/scylla-manager/
